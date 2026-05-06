@@ -1,0 +1,114 @@
+# Nervos Brain 配置文件模板
+# 复制为 config.yaml 并填入真实值：
+#   cp config.yaml.example config.yaml
+
+llm:
+  # 模型名称 (litellm 格式，openai/ 前缀 = OpenAI 兼容接口)
+  model: "openai/gpt-5.4"
+
+  # API 密钥
+  api_key: "your-api-key-here"
+
+  # API 基地址
+  api_base: "https://your-openai-compatible-endpoint/v1"
+
+  # 生成温度 (0~1，越低越确定性)
+  temperature: 0.3
+
+  # 最大输出 token 数
+  max_tokens: 2048
+
+  # 瞬时网络错误重试次数（建议 2~4）
+  max_retries: 3
+
+  # 推理强度（如 gpt-5.x 可用）
+  reasoning_effort: "high"
+
+  # 输出冗长度（如 gpt-5.x 可用）
+  verbosity: "high"
+
+  # 是否禁用响应存储（store=false）
+  disable_response_storage: true
+
+logging:
+  # 全局日志级别：DEBUG / INFO / WARNING / ERROR
+  level: "INFO"
+
+  # 第三方库日志级别
+  third_party_level: "WARNING"
+
+  # 日志目录（按 service_name 生成滚动文件）
+  log_dir: "data/logs"
+
+  # 单文件大小上限（字节）
+  max_bytes: 10485760
+
+  # 保留滚动文件数量
+  backup_count: 5
+
+  # 是否输出 JSON 日志
+  json: false
+
+  # 是否写入文件
+  file: true
+
+retrieval:
+  # Qdrant 浅层索引位置
+  qdrant_path: "data/qdrant_local"
+  collection_name: "nervos_docs"
+  vector_size: 64               # 64=确定性哈希(离线测试), 1536=真实 embedding-2
+
+  # SQLite 深层原件库路径
+  archive_db: "data/archive.db"
+
+  # 是否使用真实 embedding API（false = 离线确定性哈希）
+  use_real_embedding: false
+  embedding_model: "openai/embedding-2"
+
+  # 多路检索参数
+  top_k_per_path: 10
+  final_top_k: 10
+  rrf_k: 60
+  fuzzy_threshold: 0.55
+  enable_bm25: true
+  enable_fuzzy: true
+  enable_exact: true
+
+retrieval_forum_talk:
+  # 论坛用户讨论数据专用库（与标准文档库分离）
+  qdrant_path: "data/qdrant_talk_forum"
+  collection_name: "nervos_talk_user_discussions"
+  archive_db: "data/forum_talk/archive.db"
+
+# 当前 runtime 会按这个列表挂载多个检索库。
+# 新增库时，添加一个 retrieval_xxx section，并把 section 名加入这里。
+retrieval_backends:
+  - retrieval
+  - retrieval_forum_talk
+
+telegram_bot:
+  # 在线 Telegram Bot 轮询层配置（真实收发）
+  # token 建议放在环境变量 TELEGRAM_BOT_TOKEN，不要写入仓库
+  api_base: "https://api.telegram.org"
+  poll_timeout: 25
+  poll_limit: 20
+  offset_file: "data/telegram_bot/offset.txt"
+  memory_db: "data/telegram_bot/memory.db"
+  feedback_file: "data/telegram_bot/feedback.jsonl"
+  debug_log_file: "data/telegram_bot/debug_events.jsonl"
+  target_elapsed_ms: 30000
+  max_elapsed_ms: 90000
+
+  # 群内测阶段强烈建议只允许测试群 chat_id，避免误响应公开群。
+  # 可通过 dry-run 观察日志中的 chat_id 后填入，例如 "-1001234567890"。
+  allowed_chat_ids: []
+
+  # 打开后，Telegram 最后一段回复会附带 1-5 分 inline keyboard。
+  append_csat: true
+
+discord_bot:
+  # 在线 Discord Bot 网关配置（真实收发）
+  # token 建议放在环境变量 DISCORD_BOT_TOKEN，不要写入仓库
+  memory_db: "data/discord_bot/memory.db"
+  mention_only_in_guild: true
+  model: "openai/gpt-5.4"

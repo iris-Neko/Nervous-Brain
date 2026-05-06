@@ -1,0 +1,2370 @@
+"""M7-T1~T8: 8 个真实 GraphEngine 节点函数。"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import inspect
+import json
+import logging
+import re
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
+from nervos_brain.response_normalizer.normalizer import (
+    chunk_for_platform,
+    normalize_citations,
+    sanitize_markdown,
+    validate_response_shape,
+)
+from nervos_brain.response_normalizer.platform_formatter import format_response_to_outbound
+
+from . import prompts
+from .llm import call_llm, call_llm_json, get_last_call_meta
+from .provider_registry import ProviderCapabilityRegistry
+
+_ANSWER_COMPOSER_FALLBACK_TEXT = "证据已收集，但回答生成暂时失败，请稍后重试。"
+_DIRECT_ANSWER_FALLBACK_TEXT = "我可以直接回答低风险问题，但这次生成暂时失败了，请稍后重试。"
+_RETRIEVAL_POLICIES = {"none", "single", "deep"}
+
+
+def _normalize_info_needs_schema(info_needs: Any) -> list[dict]:
+    """Normalize the LLM schema without changing its semantic decision."""
+    if not isinstance(info_needs, list):
+        return []
+
+    sanitized: list[dict] = []
+    for raw_need in info_needs:
+        if not isinstance(raw_need, dict):
+            continue
+        need = dict(raw_need)
+        need.setdefault("kind", "concept_gap")
+        need.setdefault("question", "")
+        need["required"] = bool(need.get("required", False))
+        sanitized.append(need)
+    return sanitized
+
+
+logger = logging.getLogger(__name__)
+
+_MODEL_TIERS = {"low", "medium", "high"}
+_NODE_FALLBACK_TIERS = {
+    "info_gap_assessor": "low",
+    "retriever_planner": "low",
+    "reflection_pre": "low",
+    "reflection_post": "low",
+    "direct_answer": "low",
+    "answer_composer": "medium",
+}
+_LLM_ROUTER_SYSTEM = """你是 Nervos Brain 的模型档位路由器。
+你的唯一任务是为当前 graph 节点选择 low、medium、high 三档之一。
+只根据任务复杂度、风险和节点目标判断模型档位；不要改变 graph 路由、检索策略或回答内容。
+
+档位含义：
+- low: 简单判断、短直接回答、低风险格式/JSON 决策。
+- medium: 普通技术问答、查询计划、证据反思、需要稳定但不需要深推理。
+- high: 复杂代码生成、复杂架构方案、多证据综合、排障/错误日志、引用一致性高风险场景。
+
+选择约束：
+- reflection_pre 的常规任务通常选择 low 或 medium；不要因为“公开资料证据还不完整”就选 high。
+- 只有安全敏感决策、复杂架构权衡、真实错误日志排障、代码审计或多来源强冲突需要深推理时，才给 reflection_pre 选择 high。
+- 如果 time_budget 显示已超过目标耗时，应倾向选择能快速完成当前节点目标的最低可用档位。
+
+必须只输出 JSON：
+{"tier":"low|medium|high","reasoning":"一句话说明","confidence":0.0}
+"""
+
+
+def _budget_int(state: dict, key: str, default: int) -> int:
+    budget = state.get("budget", {})
+    if not isinstance(budget, dict):
+        return default
+    value = budget.get(key, default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _budget_float(state: dict, key: str, default: float) -> float:
+    budget = state.get("budget", {})
+    if not isinstance(budget, dict):
+        return default
+    value = budget.get(key, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalized_decision(raw: Any) -> str:
+    decision = str(raw or "").strip()
+    if decision in {"ask_user", "has_needs", "answer_direct"}:
+        return decision
+    return "has_needs"
+
+
+def _normalize_retrieval_policy(raw: Any, *, decision: str) -> str:
+    if decision in {"answer_direct", "ask_user"}:
+        return "none"
+    policy = str(raw or "").strip()
+    if policy == "none":
+        return "single"
+    if policy in _RETRIEVAL_POLICIES:
+        return policy
+    return "single"
+
+
+def _merge_policy_budget(state: dict, retrieval_policy: str) -> dict[str, Any]:
+    raw_budget = state.get("budget", {})
+    budget = dict(raw_budget) if isinstance(raw_budget, dict) else {}
+
+    def current_int(key: str, default: int) -> int:
+        try:
+            return int(budget.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    if retrieval_policy == "none":
+        budget["max_hops"] = 0
+        budget["max_tool_calls"] = 0
+        budget["max_reflection_rounds_pre"] = 0
+        budget["max_reflection_rounds_post"] = min(current_int("max_reflection_rounds_post", 1), 1)
+    elif retrieval_policy == "single":
+        budget["max_hops"] = max(1, min(current_int("max_hops", 1), 1))
+        budget["max_tool_calls"] = max(1, min(current_int("max_tool_calls", 2), 2))
+        budget["max_reflection_rounds_pre"] = max(1, min(current_int("max_reflection_rounds_pre", 1), 1))
+        budget["max_reflection_rounds_post"] = max(1, min(current_int("max_reflection_rounds_post", 1), 1))
+    else:
+        budget.setdefault("max_hops", 3)
+        budget.setdefault("max_tool_calls", 3)
+        budget.setdefault("max_reflection_rounds_pre", 2)
+        budget.setdefault("max_reflection_rounds_post", 2)
+
+    return budget
+
+
+def _int_like(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_message_context(state: dict) -> dict[str, str]:
+    user_msg = state.get("user_message", {})
+    if not isinstance(user_msg, dict):
+        return {}
+    context = user_msg.get("context", {})
+    if not isinstance(context, dict):
+        return {}
+    return {k: str(v) for k, v in context.items() if v is not None}
+
+
+def _merge_trace_summary(existing: str, extra: str) -> str:
+    left = existing.strip()
+    right = extra.strip()
+    if not left:
+        return right
+    if not right:
+        return left
+    return f"{left} | {right}"
+
+
+def _time_budget_snapshot(state: dict) -> dict[str, Any]:
+    budget = state.get("budget", {})
+    if not isinstance(budget, dict):
+        budget = {}
+    started_ms = _int_like(state.get("_request_started_ts_ms", 0))
+    now_ms = int(time.time() * 1000)
+    elapsed_ms = max(0, now_ms - started_ms) if started_ms > 0 else 0
+    target_ms = _int_like(budget.get("target_elapsed_ms", 0))
+    max_ms = _int_like(budget.get("max_elapsed_ms", 0))
+    llm_trace = state.get("_llm_trace", [])
+    node_timings = state.get("_node_timings", [])
+    return {
+        "elapsed_ms": elapsed_ms,
+        "target_elapsed_ms": target_ms,
+        "max_elapsed_ms": max_ms,
+        "remaining_target_ms": max(0, target_ms - elapsed_ms) if target_ms > 0 else 0,
+        "remaining_max_ms": max(0, max_ms - elapsed_ms) if max_ms > 0 else 0,
+        "node_timings": list(node_timings)[-8:] if isinstance(node_timings, list) else [],
+        "llm_calls": len(llm_trace) if isinstance(llm_trace, list) else 0,
+    }
+
+
+def _time_budget_prompt(state: dict) -> str:
+    snap = _time_budget_snapshot(state)
+    target = snap["target_elapsed_ms"]
+    max_ms = snap["max_elapsed_ms"]
+    if target <= 0 and max_ms <= 0:
+        return "未设置硬性耗时预算；仍应避免不必要的检索、反思和改写。"
+    return (
+        f"已用 {snap['elapsed_ms']}ms；"
+        f"目标耗时 {target or '未设置'}ms，目标剩余 {snap['remaining_target_ms']}ms；"
+        f"最大耗时 {max_ms or '未设置'}ms，最大剩余 {snap['remaining_max_ms']}ms。"
+        "如果剩余时间较少，请优先基于已有信息给出准确、简洁、带边界说明的回答，"
+        "避免额外检索、反思或重写。"
+    )
+
+
+def _merge_llm_trace(state: dict, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    existing = state.get("_llm_trace", [])
+    merged = list(existing) if isinstance(existing, list) else []
+    merged.extend(rows)
+    return merged[-80:]
+
+
+def _summarize_llm_usage(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "calls": len(rows),
+        "elapsed_ms": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "by_node": {},
+    }
+    by_node: dict[str, dict[str, int]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        elapsed = _int_like(row.get("elapsed_ms", 0))
+        usage = row.get("usage", {})
+        if not isinstance(usage, dict):
+            usage = {}
+        input_tokens = _int_like(usage.get("input_tokens", 0))
+        output_tokens = _int_like(usage.get("output_tokens", 0))
+        total_tokens = _int_like(usage.get("total_tokens", 0))
+        summary["elapsed_ms"] += elapsed
+        summary["input_tokens"] += input_tokens
+        summary["output_tokens"] += output_tokens
+        summary["total_tokens"] += total_tokens
+        node = str(row.get("node", "unknown") or "unknown")
+        bucket = by_node.setdefault(
+            node,
+            {"calls": 0, "elapsed_ms": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        )
+        bucket["calls"] += 1
+        bucket["elapsed_ms"] += elapsed
+        bucket["input_tokens"] += input_tokens
+        bucket["output_tokens"] += output_tokens
+        bucket["total_tokens"] += total_tokens
+    summary["by_node"] = by_node
+    return summary
+
+
+def _llm_meta_row(
+    state: dict,
+    *,
+    node_name: str,
+    call_kind: str,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    meta = get_last_call_meta() or {}
+    usage = meta.get("usage", {})
+    return {
+        "node": node_name,
+        "kind": call_kind,
+        "model": str(meta.get("model") or (profile or {}).get("model") or ""),
+        "tier": str((profile or {}).get("tier", "")),
+        "reasoning_effort": str(meta.get("reasoning_effort") or (profile or {}).get("reasoning_effort") or ""),
+        "json_mode": bool(meta.get("json_mode", call_kind.endswith("_json"))),
+        "max_tokens": _int_like(meta.get("max_tokens", (profile or {}).get("max_tokens", 0))),
+        "elapsed_ms": _int_like(meta.get("elapsed_ms", 0)),
+        "usage": usage if isinstance(usage, dict) else {},
+        "time_budget": _time_budget_snapshot(state),
+    }
+
+
+def _llm_update(state: dict, row: dict[str, Any]) -> dict[str, Any]:
+    rows = _merge_llm_trace(state, [row])
+    return {
+        "_llm_trace": rows,
+        "_llm_usage_summary": _summarize_llm_usage(rows),
+    }
+
+
+def _llm_update_for_call(
+    state: dict,
+    *,
+    node_name: str,
+    call_kind: str,
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    router_row = profile.get("_router_llm_row")
+    if isinstance(router_row, dict):
+        rows.append(router_row)
+    rows.append(_llm_meta_row(state, node_name=node_name, call_kind=call_kind, profile=profile))
+    merged = _merge_llm_trace(state, rows)
+    return {
+        "_llm_trace": merged,
+        "_llm_usage_summary": _summarize_llm_usage(merged),
+    }
+
+
+def _run_async_sync(awaitable: Any) -> Any:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(awaitable)
+        finally:
+            loop.close()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(awaitable)).result()
+
+
+def _archive_store_from_state(state: dict) -> Any | None:
+    archive = state.get("_archive_store")
+    if archive is not None:
+        return archive
+    retriever = state.get("_multi_retriever")
+    if retriever is None:
+        return None
+    return getattr(retriever, "_archive", None)
+
+
+def _tool_args_for_step(
+    *,
+    state: dict,
+    step: dict[str, Any],
+    tool: str,
+    query: str,
+    filters: dict[str, Any],
+    top_k: int,
+    context: dict[str, str],
+) -> dict[str, Any] | None:
+    retriever = state.get("_multi_retriever")
+    memory_service = state.get("_memory_service")
+    archive_store = _archive_store_from_state(state)
+    transport = state.get("_tool_transport") or state.get("_mcp_transport")
+
+    if tool == "qdrant_search":
+        args: dict[str, Any] = {"query": query, "filters": filters, "top_k": top_k}
+        if retriever is not None:
+            args["_multi_retriever"] = retriever
+        if state.get("_qdrant_store") is not None:
+            args["_store"] = state["_qdrant_store"]
+        return args
+
+    if tool == "discourse_query":
+        args = {"query": query, "top_k": top_k}
+        category = str(filters.get("category") or filters.get("topic") or "").strip()
+        time_range = str(step.get("time_range", filters.get("time_range", "")) or "").strip()
+        if category:
+            args["category"] = category
+        if time_range:
+            args["time_range"] = time_range
+        if archive_store is not None:
+            args["_archive_store"] = archive_store
+        if transport is not None:
+            args["_transport"] = transport
+        return args
+
+    if tool == "github_search":
+        args = {"query": query, "top_k": top_k}
+        repo = str(filters.get("repo") or filters.get("topic") or "").strip()
+        path = str(filters.get("path") or "").strip()
+        if repo:
+            args["repo"] = repo
+        if path:
+            args["path"] = path
+        if archive_store is not None:
+            args["_archive_store"] = archive_store
+        if transport is not None:
+            args["_transport"] = transport
+        return args
+
+    if tool == "memory_fetch":
+        platform = context.get("platform", "")
+        if platform and context.get("guild_id") and context.get("channel_id"):
+            args = {
+                "namespace": "channel",
+                "platform": platform,
+                "guild_id": context["guild_id"],
+                "channel_id": context["channel_id"],
+            }
+        elif platform and context.get("user_id"):
+            args = {
+                "namespace": "user",
+                "platform": platform,
+                "user_id": context["user_id"],
+            }
+        else:
+            return None
+        if memory_service is not None:
+            args["_memory_service"] = memory_service
+        return args
+
+    return None
+
+
+def _tool_trace_summary(traces: list[dict[str, Any]]) -> str:
+    if not traces:
+        return ""
+    parts: list[str] = []
+    for row in traces[:6]:
+        step_id = str(row.get("step_id", "?"))
+        tool = str(row.get("tool", "?"))
+        status = str(row.get("status", "unknown"))
+        code = str(row.get("error_code", "")).strip()
+        count = _int_like(row.get("evidence_count", 0))
+        if code:
+            status = f"{status}/{code}"
+        parts.append(f"{step_id}:{tool}={status}:{count}")
+    return "tools=" + ",".join(parts)
+
+
+def _select_model(
+    state: dict,
+    task_type: str,
+    *,
+    require_json: bool,
+) -> str | None:
+    registry = state.get("_provider_registry")
+    if registry is None:
+        registry = ProviderCapabilityRegistry()
+    if not hasattr(registry, "get_model_for"):
+        return None
+
+    try:
+        max_cost = str(state.get("_provider_max_cost", "high"))
+        return registry.get_model_for(  # type: ignore[attr-defined]
+            task_type, require_json=require_json, max_cost=max_cost
+        )
+    except Exception:
+        return None
+
+
+def _coerce_profile(raw: Any, *, fallback_tier: str = "low") -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raw = {}
+    tier = str(raw.get("tier", fallback_tier) or fallback_tier).strip().lower()
+    if tier not in {"router", "low", "medium", "high"}:
+        tier = fallback_tier if fallback_tier in {"router", "low", "medium", "high"} else "low"
+    return {
+        "tier": tier,
+        "model": str(raw.get("model", "") or ""),
+        "reasoning_effort": str(raw.get("reasoning_effort", "") or ""),
+        "verbosity": str(raw.get("verbosity", "") or ""),
+        "max_tokens": _int_like(raw.get("max_tokens", 0)),
+    }
+
+
+def _profile_kwargs(profile: dict[str, Any]) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"model": profile.get("model") or None}
+    if profile.get("reasoning_effort"):
+        kwargs["reasoning_effort"] = str(profile["reasoning_effort"])
+    if profile.get("verbosity"):
+        kwargs["verbosity"] = str(profile["verbosity"])
+    if _int_like(profile.get("max_tokens", 0)) > 0:
+        kwargs["max_tokens"] = _int_like(profile.get("max_tokens", 0))
+    return kwargs
+
+
+def _call_llm_json_with_profile(
+    system_prompt: str,
+    user_prompt: str,
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    kwargs = _profile_kwargs(profile)
+    try:
+        return call_llm_json(system_prompt, user_prompt, **kwargs)
+    except TypeError:
+        # Backward compatibility for tests or custom monkeypatches that still
+        # expose the old call_llm_json(..., model=...) signature.
+        return call_llm_json(system_prompt, user_prompt, model=kwargs.get("model"))
+
+
+def _supported_llm_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Filter optional LLM kwargs for monkeypatched legacy call signatures."""
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return kwargs
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        return kwargs
+    return {key: value for key, value in kwargs.items() if key in signature.parameters}
+
+
+def _call_llm_with_profile_kwargs(
+    system_prompt: str,
+    user_prompt: str,
+    **kwargs: Any,
+) -> str:
+    return call_llm(
+        system_prompt,
+        user_prompt,
+        **_supported_llm_kwargs(call_llm, kwargs),
+    )
+
+
+def _get_provider_registry(state: dict) -> Any:
+    registry = state.get("_provider_registry")
+    if registry is None:
+        registry = ProviderCapabilityRegistry()
+    return registry
+
+
+def _get_profile(
+    state: dict,
+    tier: str,
+    *,
+    task_type: str,
+    require_json: bool,
+) -> dict[str, Any]:
+    registry = _get_provider_registry(state)
+    if hasattr(registry, "get_profile_for"):
+        try:
+            max_cost = str(state.get("_provider_max_cost", "high"))
+            return _coerce_profile(
+                registry.get_profile_for(  # type: ignore[attr-defined]
+                    task_type,
+                    tier=tier,
+                    require_json=require_json,
+                    max_cost=max_cost,
+                ),
+                fallback_tier=tier,
+            )
+        except Exception:
+            pass
+    model = _select_model(state, task_type, require_json=require_json)
+    return {
+        "tier": tier,
+        "model": model or "",
+        "reasoning_effort": "",
+        "verbosity": "",
+        "max_tokens": 0,
+    }
+
+
+def _router_context_flags(state: dict, *, node_name: str) -> dict[str, Any]:
+    question = _effective_question(state)
+    response = state.get("_final_response", {})
+    draft = response.get("text", "") if isinstance(response, dict) else ""
+    evidence = state.get("evidence", [])
+    conflicts = state.get("conflicts", [])
+    info_needs = state.get("info_needs", [])
+    return {
+        "has_code_request": bool(re.search(r"代码|code|typescript|javascript|python|rust|示例|example", question, re.I)),
+        "has_error_or_logs": bool(re.search(r"报错|错误|error|exception|traceback|日志|log", question, re.I)),
+        "has_architecture_request": bool(re.search(r"架构|方案|设计|完整|构建|开发", question, re.I)),
+        "needs_citation_check": node_name.startswith("reflection") and bool(evidence),
+        "evidence_count": len(evidence) if isinstance(evidence, list) else 0,
+        "conflict_count": len(conflicts) if isinstance(conflicts, list) else 0,
+        "info_need_count": len(info_needs) if isinstance(info_needs, list) else 0,
+        "draft_answer_chars": len(str(draft or "")),
+    }
+
+
+def _select_model_profile(
+    state: dict,
+    task_type: str,
+    *,
+    node_name: str,
+    require_json: bool,
+    fallback_tier: str | None = None,
+) -> dict[str, Any]:
+    fallback = fallback_tier or _NODE_FALLBACK_TIERS.get(node_name, "low")
+    router_profile = _get_profile(state, "router", task_type="general", require_json=True)
+    question = _effective_question(state)
+    router_payload = {
+        "node_name": node_name,
+        "task_type": task_type,
+        "node_goal": _node_goal(node_name),
+        "question": question[:1200],
+        "retrieval_policy": str(state.get("retrieval_policy", "")),
+        "route_decision": str(state.get("_route_decision", "")),
+        "hop_count": _int_like(state.get("hop_count", 0)),
+        "retry_count": _int_like(state.get("retry_count", 0)),
+        "tool_trace_summary": _tool_trace_summary(
+            state.get("_tool_execution_trace", [])
+            if isinstance(state.get("_tool_execution_trace", []), list)
+            else []
+        ),
+        "flags": _router_context_flags(state, node_name=node_name),
+        "time_budget": _time_budget_snapshot(state),
+        "fallback_tier": fallback,
+        "allowed_tiers": ["low", "medium", "high"],
+    }
+
+    tier = fallback
+    router_result: dict[str, Any] = {}
+    try:
+        router_result = _call_llm_json_with_profile(
+            _LLM_ROUTER_SYSTEM,
+            json.dumps(router_payload, ensure_ascii=False, default=str),
+            router_profile,
+        )
+        candidate = str(router_result.get("tier", "")).strip().lower()
+        if candidate in _MODEL_TIERS:
+            tier = candidate
+    except Exception as exc:
+        logger.debug(
+            "model_router fallback node=%s fallback_tier=%s err=%s",
+            node_name,
+            fallback,
+            type(exc).__name__,
+        )
+
+    profile = _get_profile(state, tier, task_type=task_type, require_json=require_json)
+    profile["_router_llm_row"] = _router_llm_row(
+        state,
+        node_name=node_name,
+        router_profile=router_profile,
+        selected_tier=tier,
+    )
+    profile["router"] = {
+        "tier": tier,
+        "fallback_tier": fallback,
+        "reasoning": str(router_result.get("reasoning", ""))[:240]
+        if isinstance(router_result, dict)
+        else "",
+        "confidence": router_result.get("confidence")
+        if isinstance(router_result, dict)
+        else None,
+    }
+    logger.debug(
+        "model_router node=%s task=%s tier=%s model=%s reasoning_effort=%s",
+        node_name,
+        task_type,
+        profile.get("tier"),
+        profile.get("model"),
+        profile.get("reasoning_effort"),
+    )
+    return profile
+
+
+def _router_llm_row(
+    state: dict,
+    *,
+    node_name: str,
+    router_profile: dict[str, Any],
+    selected_tier: str,
+) -> dict[str, Any]:
+    row = _llm_meta_row(state, node_name=node_name, call_kind="router_json", profile=router_profile)
+    row["selected_tier"] = selected_tier
+    return row
+
+
+def _node_goal(node_name: str) -> str:
+    return {
+        "info_gap_assessor": "判断是否直答、检索或追问用户，并给出检索策略。",
+        "retriever_planner": "把信息需求转成最小必要检索计划。",
+        "reflection_pre": "判断现有证据是否足够回答核心问题。",
+        "reflection_post": "检查回答草稿是否正确、引用是否匹配、是否需要重写。",
+        "direct_answer": "直接回答低风险问题，不依赖引用。",
+        "answer_composer": "基于证据和上下文生成最终回答。",
+    }.get(node_name, "执行当前 full graph 节点任务。")
+
+
+def _thread_key_from_context(context: dict[str, str]) -> dict[str, str] | None:
+    required = ("platform", "guild_id", "channel_id", "user_id")
+    if not all(context.get(k) for k in required):
+        return None
+    base_thread = context.get("thread_id") or "__default__"
+    return {
+        "platform": context["platform"],
+        "guild_id": context["guild_id"],
+        "channel_id": context["channel_id"],
+        "thread_id": f"{base_thread}:user:{context['user_id']}",
+    }
+
+
+def _load_recent_messages(state: dict) -> list[dict[str, Any]]:
+    raw = state.get("recent_messages", [])
+    if isinstance(raw, list):
+        return [row for row in raw if isinstance(row, dict)]
+
+    svc = state.get("_memory_service")
+    if svc is None or not hasattr(svc, "list_recent_message_events"):
+        return []
+
+    context = _get_message_context(state)
+    platform = context.get("platform", "")
+    user_id = context.get("user_id", "")
+    if not platform or not user_id:
+        return []
+
+    try:
+        rows = svc.list_recent_message_events(
+            platform=platform,
+            user_id=user_id,
+            guild_id=context.get("guild_id") or None,
+            channel_id=context.get("channel_id") or None,
+            thread_id=context.get("thread_id") or None,
+            limit=_budget_int(state, "memory_context_limit", 20),
+        )
+    except Exception:
+        return []
+    return rows if isinstance(rows, list) else []
+
+
+def _format_conversation_context(messages: list[dict[str, Any]], *, limit_chars: int = 1800) -> str:
+    if not messages:
+        return "(无)"
+    lines: list[str] = []
+    for msg in messages:
+        role = str(msg.get("role", "message") or "message")
+        content = re.sub(r"\s+", " ", str(msg.get("content", "") or "")).strip()
+        if not content:
+            continue
+        if len(content) > 220:
+            content = content[:220].rstrip() + "..."
+        lines.append(f"{role}: {content}")
+    text = "\n".join(lines).strip() or "(无)"
+    if len(text) > limit_chars:
+        text = text[-limit_chars:].lstrip()
+    return text
+
+
+def _conversation_context_from_state(state: dict) -> str:
+    existing = str(state.get("conversation_context", "") or "").strip()
+    if existing:
+        return existing
+    return _format_conversation_context(_load_recent_messages(state))
+
+
+def _load_memory_facts(state: dict) -> list[dict]:
+    svc = state.get("_memory_service")
+    if svc is None:
+        return list(state.get("memory_facts", []))
+
+    context = _get_message_context(state)
+    platform = context.get("platform", "")
+    user_id = context.get("user_id", "")
+
+    facts: list[dict] = []
+    try:
+        if platform and context.get("guild_id") and context.get("channel_id"):
+            channel_key = {
+                "platform": platform,
+                "guild_id": context["guild_id"],
+                "channel_id": context["channel_id"],
+            }
+            facts.extend(svc.list_channel_facts(key=channel_key))
+    except Exception:
+        pass
+
+    try:
+        if platform and user_id:
+            user_key = {"platform": platform, "user_id": user_id}
+            facts.extend(svc.list_user_facts(key=user_key))
+    except Exception:
+        pass
+
+    # 同 id 去重，并按置信度/更新时间排序后裁剪。
+    by_id: dict[str, dict] = {}
+    for fact in facts:
+        fid = str(fact.get("id", ""))
+        if fid:
+            by_id[fid] = fact
+
+    ordered = sorted(
+        by_id.values(),
+        key=lambda f: (
+            float(f.get("confidence", 0.0)),
+            int(f.get("updated_ts_ms", 0)),
+        ),
+        reverse=True,
+    )
+    max_facts = _budget_int(state, "max_memory_facts", 8)
+    return ordered[:max_facts]
+
+
+def _resume_thread_checkpoint(state: dict) -> dict[str, object] | None:
+    svc = state.get("_memory_service")
+    if svc is None:
+        return None
+    context = _get_message_context(state)
+    key = _thread_key_from_context(context)
+    if key is None:
+        return None
+    try:
+        return svc.resume_thread(key=key)
+    except Exception:
+        return None
+
+
+def _complete_thread_checkpoint(state: dict) -> None:
+    svc = state.get("_memory_service")
+    if svc is None:
+        return
+    context = _get_message_context(state)
+    key = _thread_key_from_context(context)
+    if key is None:
+        return
+    complete = getattr(svc, "complete_thread", None)
+    if callable(complete):
+        try:
+            complete(key=key)
+        except Exception:
+            pass
+
+
+def _question_from_user_message(state: dict) -> str:
+    user_msg = state.get("user_message", {})
+    return user_msg.get("content", "") if isinstance(user_msg, dict) else str(user_msg)
+
+
+def _effective_question(state: dict) -> str:
+    resolved = state.get("resolved_question", "")
+    if isinstance(resolved, str) and resolved.strip():
+        return resolved.strip()
+    return _question_from_user_message(state).strip()
+
+
+def _merge_checkpoint_question(question: str, checkpoint: dict[str, object] | None) -> str:
+    text = str(question or "").strip()
+    if checkpoint is None:
+        return text
+    payload = checkpoint.get("context_payload", {})
+    if not isinstance(payload, dict):
+        return text
+    origin = str(payload.get("origin_question", "") or "").strip()
+    if not origin:
+        return text
+    if not text:
+        return origin
+    if origin in text or text in origin:
+        return text if len(text) >= len(origin) else origin
+    return f"{origin}\n用户补充: {text}"
+
+
+def _looks_like_new_user_intent(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text.lower())
+    if not normalized:
+        return False
+    markers = (
+        "是什么",
+        "什么是",
+        "为什么",
+        "怎么",
+        "如何",
+        "能不能",
+        "可以",
+        "给我",
+        "写一个",
+        "完整",
+        "例子",
+        "应用",
+        "开发什么",
+        "代码",
+        "?",
+        "？",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def _looks_like_checkpoint_answer(text: str, checkpoint: dict[str, object]) -> bool:
+    normalized = re.sub(r"\s+", "", text.lower())
+    if not normalized:
+        return False
+
+    param_markers = (
+        "ts",
+        "typescript",
+        "js",
+        "javascript",
+        "rust",
+        "go",
+        "python",
+        "ckb-cli",
+        "cli",
+        "sdk",
+        "ccc",
+        "node",
+        "browser",
+        "testnet",
+        "mainnet",
+        "v0.",
+        "0.",
+        "版本",
+        "环境",
+        "调用脚本",
+        "合约",
+        "脚本",
+    )
+    if any(marker in normalized for marker in param_markers):
+        return True
+
+    payload = checkpoint.get("context_payload", {})
+    ask_question = ""
+    if isinstance(payload, dict):
+        ask_question = str(payload.get("ask_user_question", "") or "").lower()
+    missing = checkpoint.get("missing_params", [])
+    missing_text = " ".join(str(item).lower() for item in missing) if isinstance(missing, list) else ""
+    if any(marker in ask_question or marker in missing_text for marker in ("sdk", "语言", "版本", "environment", "env")):
+        return len(normalized) <= 40 and not _looks_like_new_user_intent(text)
+
+    return len(normalized) <= 24 and not _looks_like_new_user_intent(text)
+
+
+def _should_resume_checkpoint(question: str, checkpoint: dict[str, object] | None) -> bool:
+    if checkpoint is None:
+        return False
+    text = str(question or "").strip()
+    if not text:
+        return False
+    if _looks_like_checkpoint_answer(text, checkpoint):
+        return True
+    if _looks_like_new_user_intent(text):
+        return False
+    return len(re.sub(r"\s+", "", text)) <= 24
+
+
+def _resume_info_needs(info_needs: list[dict]) -> list[dict]:
+    """Checkpoint 恢复后把用户本轮消息视为补参，避免继续卡在旧 required 缺参。"""
+    kept: list[dict] = []
+    for need in info_needs:
+        if not isinstance(need, dict):
+            continue
+        if bool(need.get("required", False)):
+            continue
+        kept.append(need)
+    if kept:
+        return kept
+    return [
+        {
+            "kind": "concept_gap",
+            "question": "用户已补充参数，继续检索与回答",
+            "required": False,
+        }
+    ]
+
+
+def _memory_facts_to_evidence(facts: list[dict], namespace: str) -> list[dict]:
+    evidence: list[dict] = []
+    for fact in facts:
+        fid = str(fact.get("id", ""))
+        evidence.append(
+            {
+                "id": fid,
+                "source": "memory",
+                "title": f"fact:{fact.get('key', '')}",
+                "url": f"memory://{namespace}/{fid}",
+                "anchor": "kind:fact",
+                "snippet": f"{fact.get('key', '')}={fact.get('value', '')}",
+                "score": float(fact.get("confidence", 0.0)),
+                "payload": {
+                    "source": "memory",
+                    "type": "fact",
+                    "namespace": namespace,
+                },
+                "hash": fid,
+                "retrieved_ts_ms": int(fact.get("updated_ts_ms", 0)),
+            }
+        )
+    return evidence
+
+
+def _collect_missing_params(info_needs: list[dict]) -> list[str]:
+    fields: set[str] = set()
+    for need in info_needs:
+        if not isinstance(need, dict):
+            continue
+        if not bool(need.get("required", False)):
+            continue
+
+        hints = need.get("hints", {})
+        if isinstance(hints, dict):
+            for key in hints.keys():
+                if str(key).strip():
+                    fields.add(str(key).strip())
+
+        if not hints:
+            kind = str(need.get("kind", "")).strip()
+            if kind:
+                fields.add(kind)
+
+    if not fields:
+        return ["missing_param"]
+    return sorted(fields)
+
+
+def _is_transient_llm_error(exc: Exception) -> bool:
+    text = f"{exc.__class__.__name__}: {exc}".lower()
+    markers = (
+        "timeout",
+        "timed out",
+        "serviceunavailable",
+        "unavailable",
+        "temporarily",
+        "try again later",
+        "rate limit",
+        "429",
+        "503",
+        "handshake",
+        "connection",
+    )
+    return any(m in text for m in markers)
+
+
+def _call_llm_with_retry(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    model: str | None,
+    reasoning_effort: str | None = None,
+    verbosity: str | None = None,
+    max_tokens: int | None = None,
+    max_attempts: int = 2,
+) -> str:
+    last_exc: Exception | None = None
+    attempts = max(1, int(max_attempts))
+    for idx in range(attempts):
+        try:
+            return _call_llm_with_profile_kwargs(
+                system_prompt,
+                user_prompt,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                verbosity=verbosity,
+                max_tokens=max_tokens,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if idx >= attempts - 1 or not _is_transient_llm_error(exc):
+                raise
+            time.sleep(min(2.0, 0.6 * (2**idx)))
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("unexpected llm retry state")
+
+
+def _normalize_ask_user_question(raw: str) -> str:
+    text = re.sub(r"\s+", " ", str(raw or "")).strip()
+    if not text:
+        return "请问您能提供更多信息吗？"
+
+    # Keep text concise and avoid overlong noisy prompts.
+    if len(text) > 220:
+        text = text[:220].rstrip() + "…"
+
+    generic_uncertainty_markers = (
+        "当前信息存在不确定性",
+        "补充具体版本、环境或目标",
+        "补充具体版本、运行环境或目标",
+    )
+    if any(marker in text for marker in generic_uncertainty_markers):
+        return "请补充具体版本、运行环境或你想实现的目标，可以吗？"
+
+    question_markers = ("？", "?", "吗", "呢", "是否", "可否", "能否")
+    if any(marker in text for marker in question_markers):
+        return text
+
+    if text.startswith(("请", "您", "你")):
+        return text + "？"
+
+    # Convert noun phrase / topic phrase into an explicit clarification question.
+    return f"为了准确回答，我先确认一下：你是想了解“{text}”吗？"
+
+
+# ---------------------------------------------------------------------------
+# M7-T1: InfoGapAssessor — 信息缺口评估
+# ---------------------------------------------------------------------------
+
+def info_gap_assessor(state: dict) -> dict:
+    """调 LLM 分析问题，判断 ask_user / has_needs / answer_direct。"""
+    raw_question = _question_from_user_message(state)
+    facts = _load_memory_facts(state)
+    evidence = state.get("evidence", [])
+    checkpoint = _resume_thread_checkpoint(state)
+    should_resume_checkpoint = _should_resume_checkpoint(raw_question, checkpoint)
+    if checkpoint is not None and not should_resume_checkpoint:
+        _complete_thread_checkpoint(state)
+        checkpoint = None
+    question = _merge_checkpoint_question(raw_question, checkpoint)
+    recent_messages = _load_recent_messages(state)
+    conversation_context = _format_conversation_context(recent_messages)
+
+    user_prompt = prompts.INFO_GAP_USER.format(
+        question=question,
+        conversation_context=conversation_context,
+        memory_facts=json.dumps(facts, ensure_ascii=False, default=str)[:500],
+        evidence_count=len(evidence),
+        time_budget=_time_budget_prompt(state),
+    )
+
+    if checkpoint:
+        thread_state: dict[str, Any] = {
+            "missing_params": checkpoint.get("missing_params", []),
+            "resume_node": checkpoint.get("resume_node", ""),
+        }
+        context_payload = checkpoint.get("context_payload", {})
+        if isinstance(context_payload, dict) and context_payload:
+            thread_state["context_payload"] = context_payload
+        user_prompt += (
+            "\n线程恢复状态: "
+            + json.dumps(thread_state, ensure_ascii=False)
+        )
+
+    profile = _select_model_profile(
+        state,
+        "planning",
+        node_name="info_gap_assessor",
+        require_json=True,
+        fallback_tier="low",
+    )
+    try:
+        result = _call_llm_json_with_profile(
+            prompts.INFO_GAP_SYSTEM,
+            user_prompt,
+            profile,
+        )
+        llm_trace_update = _llm_update_for_call(
+            state,
+            node_name="info_gap_assessor",
+            call_kind="business_json",
+            profile=profile,
+        )
+    except Exception:
+        result = {
+            "decision": "has_needs" if question.strip() else "ask_user",
+            "info_needs": [],
+        }
+        llm_trace_update = {}
+
+    decision = _normalized_decision(result.get("decision", "has_needs"))
+    info_needs = _normalize_info_needs_schema(result.get("info_needs", []))
+
+    retrieval_policy = _normalize_retrieval_policy(
+        result.get("retrieval_policy"),
+        decision=decision,
+    )
+    existing_conflicts = state.get("conflicts", [])
+    if (
+        decision == "has_needs"
+        and isinstance(existing_conflicts, list)
+        and existing_conflicts
+    ):
+        retrieval_policy = "deep"
+
+    # 显式兼容旧调用：只有调用方主动传 force_retrieval=True 时才强制检索。
+    force_retrieval = bool(state.get("force_retrieval", False))
+    if force_retrieval and decision == "answer_direct" and question.strip():
+        decision = "has_needs"
+        retrieval_policy = "single"
+        if not info_needs:
+            info_needs = [
+                {
+                    "kind": "concept_gap",
+                    "question": "需要先检索相关资料后再回答",
+                    "required": False,
+                }
+            ]
+
+    # 如果线程里有待恢复 checkpoint，默认把本轮消息当作补参继续推进。
+    if checkpoint is not None and should_resume_checkpoint and question.strip():
+        decision = "has_needs"
+        retrieval_policy = "single" if retrieval_policy == "none" else retrieval_policy
+        _complete_thread_checkpoint(state)
+        info_needs = _resume_info_needs(info_needs)
+        if info_needs:
+            info_needs[0].setdefault("hints", {})
+            if isinstance(info_needs[0]["hints"], dict):
+                info_needs[0]["hints"].setdefault(
+                    "resume_node",
+                    str(checkpoint.get("resume_node", "retriever_planner")),
+                )
+
+    update: dict[str, Any] = {
+        "_route_decision": decision,
+        "retrieval_policy": retrieval_policy,
+        "info_needs": info_needs,
+        "memory_facts": facts,
+        "recent_messages": recent_messages,
+        "conversation_context": conversation_context,
+        "resolved_question": question,
+        "budget": _merge_policy_budget(state, retrieval_policy),
+        **llm_trace_update,
+    }
+    logger.debug(
+        "info_gap_assessor decision=%s retrieval_policy=%s info_needs=%d checkpoint=%s",
+        decision,
+        retrieval_policy,
+        len(info_needs),
+        bool(checkpoint),
+    )
+    return update
+
+
+# ---------------------------------------------------------------------------
+# M7-T2: RetrieverPlanner — 检索规划
+# ---------------------------------------------------------------------------
+
+def retriever_planner(state: dict) -> dict:
+    """调 LLM 根据 info_needs 生成 RetrievalPlan (JSON)。"""
+    question = _effective_question(state)
+    reflection_hints = state.get("reflection_hints", {})
+    if isinstance(reflection_hints, dict):
+        next_query = str(reflection_hints.get("next_query", "")).strip()
+        if next_query:
+            question = next_query
+    info_needs = state.get("info_needs", [])
+    retry_count = state.get("retry_count", 0)
+    facts = state.get("memory_facts", [])
+
+    user_prompt = prompts.RETRIEVER_PLANNER_USER.format(
+        info_needs=json.dumps(info_needs, ensure_ascii=False, default=str),
+        question=question,
+        retrieval_policy=str(state.get("retrieval_policy", "single")),
+        retry_count=retry_count,
+        conversation_context=_conversation_context_from_state(state),
+        time_budget=_time_budget_prompt(state),
+    )
+    if facts:
+        user_prompt += "\n可用记忆事实:\n" + json.dumps(facts, ensure_ascii=False, default=str)[:800]
+
+    profile = _select_model_profile(
+        state,
+        "planning",
+        node_name="retriever_planner",
+        require_json=True,
+        fallback_tier="low",
+    )
+    try:
+        plan = _call_llm_json_with_profile(
+            prompts.RETRIEVER_PLANNER_SYSTEM,
+            user_prompt,
+            profile,
+        )
+        llm_trace_update = _llm_update_for_call(
+            state,
+            node_name="retriever_planner",
+            call_kind="business_json",
+            profile=profile,
+        )
+    except Exception:
+        plan = {
+            "plan_id": f"plan_{uuid.uuid4().hex[:8]}",
+            "rationale": "fallback plan",
+            "steps": [
+                {
+                    "step_id": "step_1",
+                    "tool": "qdrant_search",
+                    "query": question,
+                    "filters": {},
+                    "top_k": 5,
+                }
+            ],
+            "parallel_groups": [["step_1"]],
+            "budget": {},
+        }
+        llm_trace_update = {}
+
+    plan.setdefault("plan_id", f"plan_{uuid.uuid4().hex[:8]}")
+    plan.setdefault("rationale", "")
+    raw_steps = plan.get("steps", [])
+    if not isinstance(raw_steps, list):
+        raw_steps = []
+
+    max_tool_calls = _budget_int(state, "max_tool_calls", 3)
+    max_evidence_chunks = _budget_int(state, "max_evidence_chunks", 8)
+    supported_tools = {"qdrant_search", "discourse_query", "github_search", "memory_fetch"}
+    normalized_steps: list[dict] = []
+    for raw_step in raw_steps[:max_tool_calls]:
+        if not isinstance(raw_step, dict):
+            continue
+        step_top_k = raw_step.get("top_k", min(5, max_evidence_chunks))
+        try:
+            step_top_k = int(step_top_k)
+        except (TypeError, ValueError):
+            step_top_k = min(5, max_evidence_chunks)
+        step_top_k = max(1, min(step_top_k, 20))
+        raw_tool = str(raw_step.get("tool", "qdrant_search")).strip() or "qdrant_search"
+        tool = raw_tool if raw_tool in supported_tools else "qdrant_search"
+        step = {
+            "step_id": str(raw_step.get("step_id", f"step_{uuid.uuid4().hex[:4]}")),
+            "tool": tool,
+            "query": str(raw_step.get("query", question)).strip() or question,
+            "filters": raw_step.get("filters", {})
+            if isinstance(raw_step.get("filters", {}), dict)
+            else {},
+            "top_k": step_top_k,
+        }
+        time_range = str(raw_step.get("time_range", "") or "").strip()
+        if time_range:
+            step["time_range"] = time_range
+        normalized_steps.append(step)
+
+    if not normalized_steps:
+        normalized_steps = [
+            {
+                "step_id": "step_1",
+                "tool": "qdrant_search",
+                "query": question,
+                "filters": {},
+                "top_k": min(5, max_evidence_chunks),
+            }
+        ]
+
+    step_ids = {step["step_id"] for step in normalized_steps}
+    raw_groups = plan.get("parallel_groups", [])
+    groups: list[list[str]] = []
+    if isinstance(raw_groups, list):
+        for group in raw_groups:
+            if not isinstance(group, list):
+                continue
+            valid = [str(step_id) for step_id in group if str(step_id) in step_ids]
+            if valid:
+                groups.append(valid)
+    if not groups:
+        groups = [[step["step_id"] for step in normalized_steps]]
+
+    return {
+        "retrieval_plan": {
+            "plan_id": str(plan["plan_id"]),
+            "rationale": str(plan["rationale"]),
+            "steps": normalized_steps,
+            "parallel_groups": groups,
+            "budget": {
+                "max_tool_calls": max_tool_calls,
+                "max_evidence_chunks": max_evidence_chunks,
+            },
+        },
+        **llm_trace_update,
+    }
+
+
+# ---------------------------------------------------------------------------
+# M7-T3: RetrievalExecutor — 执行检索计划
+# ---------------------------------------------------------------------------
+
+def retrieval_executor(state: dict) -> dict:
+    """从 retrieval_plan 取 steps，逐步构造 ToolCallRequest 并调 ToolRuntime。"""
+    from nervos_brain.tool_runtime import (
+        build_tool_call_request,
+        check_idempotency,
+        execute_tool,
+    )
+    from nervos_brain.tool_runtime.handlers import TOOL_HANDLERS
+
+    plan = state.get("retrieval_plan", {})
+    steps = plan.get("steps", [])
+    request_id = state.get("request_id", "unknown")
+    max_tool_calls = _budget_int(state, "max_tool_calls", 3)
+    max_evidence_chunks = _budget_int(state, "max_evidence_chunks", 8)
+    existing_evidence = list(state.get("evidence", []))
+    context = _get_message_context(state)
+
+    tool_calls = 0
+    tool_traces: list[dict[str, Any]] = []
+
+    for step in steps[:max_tool_calls]:
+        if len(existing_evidence) >= max_evidence_chunks:
+            tool_traces.append(
+                {
+                    "step_id": str(step.get("step_id", "step_0")),
+                    "tool": str(step.get("tool", "qdrant_search")),
+                    "status": "skipped",
+                    "error_code": "ERR_BUDGET_EXCEEDED",
+                    "evidence_count": 0,
+                }
+            )
+            break
+
+        tool = step.get("tool", "qdrant_search")
+        query = str(step.get("query", ""))
+        filters = step.get("filters", {}) if isinstance(step.get("filters", {}), dict) else {}
+        top_k = step.get("top_k", 5)
+        try:
+            top_k = int(top_k)
+        except (TypeError, ValueError):
+            top_k = 5
+        top_k = max(1, min(top_k, 20))
+        step_id = str(step.get("step_id", "step_0"))
+        args = _tool_args_for_step(
+            state=state,
+            step=step,
+            tool=str(tool),
+            query=query,
+            filters=filters,
+            top_k=top_k,
+            context=context,
+        )
+        if not isinstance(args, dict):
+            tool_traces.append(
+                {
+                    "step_id": step_id,
+                    "tool": str(tool),
+                    "status": "skipped",
+                    "error_code": "ERR_TOOL_SCHEMA_INVALID",
+                    "evidence_count": 0,
+                }
+            )
+            continue
+
+        try:
+            req = build_tool_call_request(
+                request_id=request_id,
+                step_id=step_id,
+                tool=tool,
+                args=args,
+            )
+        except ValueError as exc:
+            tool_traces.append(
+                {
+                    "step_id": step_id,
+                    "tool": str(tool),
+                    "status": "error",
+                    "error_code": "ERR_TOOL_SCHEMA_INVALID",
+                    "error_message": str(exc)[:200],
+                    "evidence_count": 0,
+                }
+            )
+            continue
+
+        if check_idempotency(req["idempotency_key"]):
+            tool_traces.append(
+                {
+                    "step_id": step_id,
+                    "tool": str(tool),
+                    "status": "duplicate",
+                    "evidence_count": 0,
+                }
+            )
+            continue
+
+        handler = TOOL_HANDLERS.get(tool)
+        if handler is None:
+            tool_traces.append(
+                {
+                    "step_id": step_id,
+                    "tool": str(tool),
+                    "status": "error",
+                    "error_code": "ERR_MCP_TRANSPORT_UNAVAILABLE",
+                    "evidence_count": 0,
+                }
+            )
+            continue
+
+        try:
+            result = _run_async_sync(execute_tool(req, handler))
+        except Exception as exc:
+            tool_traces.append(
+                {
+                    "step_id": step_id,
+                    "tool": str(tool),
+                    "status": "error",
+                    "error_code": "ERR_TOOL_EXECUTION_FAILED",
+                    "error_message": str(exc)[:200],
+                    "evidence_count": 0,
+                }
+            )
+            continue
+
+        tool_calls += 1
+        evidence_items = result.get("evidence", []) if isinstance(result, dict) else []
+        evidence_count = len(evidence_items) if isinstance(evidence_items, list) else 0
+        trace_row = {
+            "step_id": step_id,
+            "tool": str(tool),
+            "status": "empty" if result.get("ok") and evidence_count == 0 else str(result.get("status", "error")),
+            "evidence_count": evidence_count,
+            "latency_ms": max(
+                0,
+                _int_like(result.get("finished_ts_ms", 0)) - _int_like(result.get("started_ts_ms", 0)),
+            ),
+        }
+        if isinstance(result.get("error"), dict):
+            trace_row["error_code"] = str(result["error"].get("code", ""))
+            trace_row["error_message"] = str(result["error"].get("message", ""))
+        tool_traces.append(trace_row)
+
+        if result.get("ok") and isinstance(evidence_items, list):
+            existing_evidence.extend(evidence_items)
+            existing_evidence = existing_evidence[:max_evidence_chunks]
+
+    tool_summary = _tool_trace_summary(tool_traces)
+    logger.debug(
+        "retrieval_executor request_id=%s tool_calls=%d evidence=%d %s",
+        state.get("request_id", "unknown"),
+        tool_calls,
+        len(existing_evidence),
+        tool_summary,
+    )
+    return {
+        "evidence": existing_evidence,
+        "_tool_calls_executed": tool_calls,
+        "_tool_execution_trace": tool_traces,
+        "_tool_execution_summary": tool_summary,
+        "hop_count": _int_like(state.get("hop_count", 0)) + 1,
+    }
+
+
+# ---------------------------------------------------------------------------
+# M7-T4: EvidenceMerger — 证据去重与冲突检测
+# ---------------------------------------------------------------------------
+
+def evidence_merger(state: dict) -> dict:
+    """去重 (by hash) + 简单冲突检测 (source/version 比对)。"""
+    evidence_list = state.get("evidence", [])
+
+    seen_hashes: set[str] = set()
+    deduped: list[dict] = []
+    for ev in evidence_list:
+        h = ev.get("hash", "")
+        if not h:
+            h = hashlib.sha256(json.dumps(ev, sort_keys=True, default=str).encode()).hexdigest()
+            ev["hash"] = h
+        if h not in seen_hashes:
+            seen_hashes.add(h)
+            deduped.append(ev)
+
+    conflicts: list[dict] = []
+    for i, a in enumerate(deduped):
+        for b in deduped[i + 1:]:
+            a_payload = a.get("payload", {})
+            b_payload = b.get("payload", {})
+            if (
+                a_payload.get("source") == b_payload.get("source")
+                and a_payload.get("version", "") != b_payload.get("version", "")
+                and a_payload.get("version") and b_payload.get("version")
+            ):
+                conflicts.append({
+                    "a_id": a.get("id", ""),
+                    "b_id": b.get("id", ""),
+                    "reason": "version_mismatch",
+                })
+
+    return {"evidence": deduped, "conflicts": conflicts}
+
+
+# ---------------------------------------------------------------------------
+# M7-T5: Reflection (通用反思，覆盖证据与回答草稿)
+# ---------------------------------------------------------------------------
+
+def _stage_label(stage: str) -> str:
+    if stage == "post_answer":
+        return "自检"
+    return "证据评分"
+
+
+def _summarize_evidence(evidence: list[dict]) -> str:
+    return "\n".join(
+        f"- [{e.get('source', '?')}] {e.get('title', '?')}: {e.get('snippet', '')[:200]}"
+        for e in evidence[:10]
+    ) or "(无证据)"
+
+
+def _summarize_conflicts(conflicts: list[dict]) -> str:
+    return "\n".join(
+        f"- {c.get('a_id', '?')} vs {c.get('b_id', '?')}: {c.get('reason', '?')}"
+        for c in conflicts
+    ) or "(无冲突)"
+
+
+def _summarize_citations(citations: list[dict]) -> str:
+    return "\n".join(
+        f"{c.get('label', '?')}: {c.get('title', '?')} ({c.get('url', '')})"
+        for c in citations[:10]
+        if isinstance(c, dict)
+    ) or "(无引用)"
+
+
+def _has_reference_section(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(?im)^\s{0,3}(?:#{1,6}\s*)?(参考来源|引用来源|References|Sources)\b",
+            text,
+        )
+    )
+
+
+def _append_reference_section(text: str, citations: list[dict[str, Any]]) -> str:
+    if not citations or _has_reference_section(text):
+        return text.strip()
+
+    rows: list[str] = []
+    for idx, citation in enumerate(citations, start=1):
+        if not isinstance(citation, dict):
+            continue
+        label = str(citation.get("label") or f"[{idx}]").strip()
+        title = str(citation.get("title") or "").strip()
+        url = str(citation.get("url") or "").strip()
+        anchor = str(citation.get("anchor") or "").strip()
+        if not title:
+            title = url or anchor or "来源"
+        if url:
+            rows.append(f"{label} **{title}**\n{url}")
+        else:
+            rows.append(f"{label} **{title}**")
+
+    if not rows:
+        return text.strip()
+    return text.strip() + "\n\n## 参考来源\n\n" + "\n\n".join(rows)
+
+
+def _required_questions(info_needs: list[dict]) -> list[str]:
+    questions: list[str] = []
+    for need in info_needs:
+        if not isinstance(need, dict):
+            continue
+        if not bool(need.get("required", False)):
+            continue
+        question = str(need.get("question", "")).strip()
+        if question:
+            questions.append(question)
+    return questions
+
+
+def _reflection_has_user_required_clarification(
+    info_needs: list[dict],
+    hints: dict[str, Any],
+) -> bool:
+    """Return true only when the ask_user action is backed by user-owned missing data."""
+    if _required_questions(info_needs):
+        return True
+    clarify_question = str(hints.get("clarify_question", "") or "").strip()
+    if not clarify_question:
+        return False
+    missing_params = hints.get("missing_params", [])
+    if isinstance(missing_params, list) and any(str(item).strip() for item in missing_params):
+        return True
+    if isinstance(missing_params, str) and missing_params.strip():
+        return True
+    return False
+
+
+def _pre_answer_budget_exhausted(state: dict, *, reflection_round: int) -> bool:
+    hop_count = max(_int_like(state.get("hop_count", 0)), _int_like(state.get("retry_count", 0)))
+    max_hops = _budget_int(state, "max_hops", 3)
+    max_pre_rounds = _budget_int(state, "max_reflection_rounds_pre", 2)
+    return hop_count >= max_hops or reflection_round >= max_pre_rounds
+
+
+def _normalize_reflection_decision(raw: str, *, stage: str) -> str:
+    decision = str(raw).strip()
+    allowed = {"continue_retrieval", "ask_user", "revise_answer", "accept_answer"}
+    if decision in allowed:
+        return decision
+    if stage == "post_answer":
+        return "revise_answer"
+    return "continue_retrieval"
+
+
+def _heuristic_reflection_pre(state: dict) -> dict[str, Any]:
+    info_needs = state.get("info_needs", [])
+    evidence = state.get("evidence", [])
+    conflicts = state.get("conflicts", [])
+    question = _effective_question(state)
+
+    req_questions = _required_questions(info_needs if isinstance(info_needs, list) else [])
+    if req_questions:
+        return {
+            "decision": "ask_user",
+            "reasoning": "缺少必填参数，先追问用户再继续。",
+            "uncertainty_score": 0.92,
+            "clarify_question": req_questions[0],
+            "missing_params": _collect_missing_params(info_needs),
+        }
+
+    if conflicts:
+        return {
+            "decision": "continue_retrieval",
+            "reasoning": "证据存在公开资料版本冲突，应继续检索或基于现有证据说明边界，不应让用户裁决。",
+            "uncertainty_score": 0.58,
+            "next_query": question,
+        }
+
+    if not evidence:
+        return {
+            "decision": "continue_retrieval",
+            "reasoning": "暂无证据，继续检索。",
+            "uncertainty_score": 0.35,
+            "next_query": question,
+        }
+
+    if len(evidence) < 2:
+        return {
+            "decision": "continue_retrieval",
+            "reasoning": "证据数量偏少，建议补一跳检索。",
+            "uncertainty_score": 0.40,
+            "next_query": question,
+        }
+
+    return {
+        "decision": "accept_answer",
+        "reasoning": "证据可支撑回答，进入回答组装。",
+        "uncertainty_score": 0.20,
+    }
+
+
+def _heuristic_reflection_post(state: dict) -> dict[str, Any]:
+    response = state.get("_final_response", {})
+    if not isinstance(response, dict):
+        response = {}
+    text = str(response.get("text", "") or "")
+    citations = response.get("citations", [])
+    if not isinstance(citations, list):
+        citations = []
+
+    evidence = state.get("evidence", [])
+    conflicts = state.get("conflicts", [])
+    compose_error = state.get("_compose_error")
+    question = _effective_question(state)
+
+    if state.get("_direct_answer") and not isinstance(compose_error, dict):
+        if text.strip():
+            return {
+                "decision": "accept_answer",
+                "reasoning": "低风险直接回答无需引用，可发布。",
+                "uncertainty_score": 0.18,
+            }
+        return {
+            "decision": "revise_answer",
+            "reasoning": "直接回答为空，需重写。",
+            "uncertainty_score": 0.85,
+            "revise_instructions": "请给出简洁直接回答，不要编造需要检索的细节。",
+        }
+
+    if isinstance(compose_error, dict):
+        return {
+            "decision": "revise_answer",
+            "reasoning": "回答生成阶段出现异常，先重试生成。",
+            "uncertainty_score": 0.93,
+            "revise_instructions": "请基于现有证据重新生成完整回答，并确保引用编号正确。",
+        }
+
+    if text.strip() == _ANSWER_COMPOSER_FALLBACK_TEXT:
+        return {
+            "decision": "revise_answer",
+            "reasoning": "检测到回答生成失败兜底文案，需要重试回答生成。",
+            "uncertainty_score": 0.90,
+            "revise_instructions": "请重试回答生成，若失败请给出简短故障说明。",
+        }
+
+    if conflicts:
+        return {
+            "decision": "ask_user",
+            "reasoning": "证据冲突未解，回答难以保证可靠性。",
+            "uncertainty_score": 0.82,
+            "clarify_question": "不同来源结论不一致，能否补充你使用的具体版本或场景？",
+        }
+
+    if not text.strip():
+        return {
+            "decision": "revise_answer",
+            "reasoning": "回答草稿为空，需重写。",
+            "uncertainty_score": 0.90,
+            "revise_instructions": "请给出简洁结论并包含可验证引用。",
+        }
+
+    labels_in_text = set(re.findall(r"\[\d+\]", text))
+    labels_in_citations = {
+        str(c.get("label", "")) for c in citations if isinstance(c, dict)
+    }
+    if labels_in_text and not labels_in_text.issubset(labels_in_citations):
+        return {
+            "decision": "revise_answer",
+            "reasoning": "正文引用编号与引用列表不一致。",
+            "uncertainty_score": 0.72,
+            "revise_instructions": "修复正文引用编号与 citations 映射关系。",
+        }
+
+    if not evidence:
+        return {
+            "decision": "continue_retrieval",
+            "reasoning": "草稿缺乏证据支撑，回到检索。",
+            "uncertainty_score": 0.75,
+            "next_query": question,
+        }
+
+    if not citations:
+        return {
+            "decision": "revise_answer",
+            "reasoning": "回答缺少引用。",
+            "uncertainty_score": 0.60,
+            "revise_instructions": "补全关键断言对应的引用编号。",
+        }
+
+    max_considered = max(1, min(len(evidence), 10))
+    coverage = len(citations[:10]) / max_considered
+    if coverage < 0.4:
+        return {
+            "decision": "revise_answer",
+            "reasoning": "引用覆盖率偏低。",
+            "uncertainty_score": 0.55,
+            "revise_instructions": "增加关键断言的引用覆盖率。",
+        }
+
+    return {
+        "decision": "accept_answer",
+        "reasoning": "回答与引用基本一致，可发布。",
+        "uncertainty_score": 0.18,
+    }
+
+
+def _reflection_fallback(state: dict, *, stage: str) -> dict[str, Any]:
+    if stage == "post_answer":
+        return _heuristic_reflection_post(state)
+    return _heuristic_reflection_pre(state)
+
+
+def _reflect(state: dict, *, stage: str) -> dict[str, Any]:
+    question = _effective_question(state)
+    info_needs = state.get("info_needs", [])
+    if not isinstance(info_needs, list):
+        info_needs = []
+    memory_facts = state.get("memory_facts", [])
+    if not isinstance(memory_facts, list):
+        memory_facts = []
+    evidence = state.get("evidence", [])
+    if not isinstance(evidence, list):
+        evidence = []
+    conflicts = state.get("conflicts", [])
+    if not isinstance(conflicts, list):
+        conflicts = []
+    response = state.get("_final_response", {})
+    if not isinstance(response, dict):
+        response = {}
+    draft_answer = str(response.get("text", "") or "")
+    compose_error = state.get("_compose_error")
+    citations = response.get("citations", [])
+    if not isinstance(citations, list):
+        citations = []
+
+    round_key = "_reflection_rounds_post" if stage == "post_answer" else "_reflection_rounds_pre"
+    reflection_round = _int_like(state.get(round_key, 0)) + 1
+    stage_label = _stage_label(stage)
+
+    user_prompt = prompts.REFLECTION_USER.format(
+        stage=stage,
+        question=question,
+        info_needs=json.dumps(info_needs, ensure_ascii=False, default=str),
+        memory_facts=json.dumps(memory_facts, ensure_ascii=False, default=str)[:800],
+        evidence_count=len(evidence),
+        evidence_summary=_summarize_evidence(evidence),
+        conflict_count=len(conflicts),
+        conflicts_summary=_summarize_conflicts(conflicts),
+        draft_answer=draft_answer[:2400] or "(暂无草稿)",
+        citations_summary=_summarize_citations(citations),
+        hop_count=_int_like(state.get("hop_count", 0)),
+        reflection_round=reflection_round,
+        time_budget=_time_budget_prompt(state),
+    )
+
+    node_name = "reflection_post" if stage == "post_answer" else "reflection_pre"
+    profile = _select_model_profile(
+        state,
+        "reflection",
+        node_name=node_name,
+        require_json=True,
+        fallback_tier="low",
+    )
+    try:
+        raw_result = _call_llm_json_with_profile(
+            prompts.REFLECTION_SYSTEM.format(stage_label=stage_label),
+            user_prompt,
+            profile,
+        )
+        llm_trace_update = _llm_update_for_call(
+            state,
+            node_name=node_name,
+            call_kind="business_json",
+            profile=profile,
+        )
+    except Exception:
+        raw_result = _reflection_fallback(state, stage=stage)
+        llm_trace_update = {}
+
+    if not isinstance(raw_result, dict):
+        raw_result = _reflection_fallback(state, stage=stage)
+
+    # 兼容旧格式：DocGrader / SelfCheck 输出。
+    if "decision" not in raw_result and "grade" in raw_result:
+        grade = str(raw_result.get("grade", "need_more"))
+        raw_result["decision"] = (
+            "continue_retrieval"
+            if grade == "need_more"
+            else "accept_answer"
+        )
+        raw_result.setdefault("uncertainty_score", 0.4 if grade == "need_more" else 0.2)
+    if "decision" not in raw_result and "pass" in raw_result:
+        passed = bool(raw_result.get("pass", False))
+        raw_result["decision"] = "accept_answer" if passed else "revise_answer"
+        raw_result.setdefault("uncertainty_score", 0.2 if passed else 0.6)
+
+    decision = _normalize_reflection_decision(raw_result.get("decision", ""), stage=stage)
+    reasoning = str(raw_result.get("reasoning", "")).strip()
+    try:
+        uncertainty = float(raw_result.get("uncertainty_score", 0.5))
+    except (TypeError, ValueError):
+        uncertainty = 0.5
+    uncertainty = max(0.0, min(1.0, uncertainty))
+
+    hints: dict[str, Any] = {}
+    for key in ("missing_params", "clarify_question", "next_query", "revise_instructions"):
+        if key in raw_result and raw_result[key] not in (None, ""):
+            hints[key] = raw_result[key]
+
+    # 防止 pre-answer 阶段过早追问：
+    # ask_user 只允许用于用户私有/现场必填信息；公开资料缺口或版本冲突应继续检索，
+    # 若预算已耗尽且已有证据，则基于现有证据回答并说明边界。
+    req_questions = _required_questions(info_needs)
+    has_user_required_clarification = _reflection_has_user_required_clarification(info_needs, hints)
+    pre_budget_exhausted = (
+        stage == "pre_answer"
+        and _pre_answer_budget_exhausted(state, reflection_round=reflection_round)
+    )
+    if stage == "pre_answer" and decision == "ask_user":
+        if not has_user_required_clarification:
+            decision = "accept_answer" if evidence and pre_budget_exhausted else "continue_retrieval"
+            hints.pop("clarify_question", None)
+            hints.pop("missing_params", None)
+            if decision == "continue_retrieval" and not hints.get("next_query"):
+                hints["next_query"] = question
+            if not reasoning:
+                reasoning = "没有明确缺少用户私有必填信息，不应追问用户。"
+
+    # post-answer 若生成器已报错，不能 accept_answer。
+    if stage == "post_answer" and (
+        isinstance(compose_error, dict) or draft_answer.strip() == _ANSWER_COMPOSER_FALLBACK_TEXT
+    ):
+        decision = "revise_answer"
+        uncertainty = max(uncertainty, 0.90)
+        if not reasoning:
+            reasoning = "回答生成阶段失败，需重试回答生成。"
+        hints.setdefault("revise_instructions", "请基于现有证据重试回答生成。")
+
+    # 主动追问策略：高不确定度时，优先让用户补充上下文。
+    ask_threshold = _budget_float(state, "ask_user_uncertainty_threshold", 0.45)
+    if decision == "continue_retrieval" and uncertainty >= ask_threshold:
+        should_ask_user = True
+        if stage == "pre_answer":
+            # pre-answer 不因“高不确定度”单独触发追问；
+            # 只有用户私有/现场必填信息才追问；公开资料冲突继续检索或回答。
+            should_ask_user = has_user_required_clarification
+
+        if should_ask_user:
+            decision = "ask_user"
+            if not hints.get("clarify_question"):
+                hints["clarify_question"] = (
+                    req_questions[0]
+                    if req_questions
+                    else "当前信息存在不确定性，请补充具体版本、环境或目标。"
+                )
+        elif stage == "pre_answer" and evidence and pre_budget_exhausted:
+            decision = "accept_answer"
+            hints.pop("clarify_question", None)
+            hints.pop("missing_params", None)
+
+    if (
+        stage == "pre_answer"
+        and decision == "continue_retrieval"
+        and evidence
+        and pre_budget_exhausted
+        and not has_user_required_clarification
+    ):
+        decision = "accept_answer"
+        hints.pop("clarify_question", None)
+        hints.pop("missing_params", None)
+
+    update: dict[str, Any] = {
+        "reflection_stage": stage,
+        "reflection_decision": decision,
+        "reflection_reasoning": reasoning,
+        "uncertainty_score": uncertainty,
+        "reflection_hints": hints,
+        "reflection_round": reflection_round,
+        round_key: reflection_round,
+        **llm_trace_update,
+    }
+
+    # 兼容旧字段，避免历史逻辑/测试直接断裂。
+    if stage == "post_answer":
+        update["_self_check_pass"] = decision == "accept_answer"
+    else:
+        update["_grade"] = (
+            "enough" if decision in {"accept_answer", "revise_answer"} else "need_more"
+        )
+    logger.debug(
+        "reflection stage=%s decision=%s uncertainty=%.2f round=%d evidence=%d conflicts=%d",
+        stage,
+        decision,
+        uncertainty,
+        reflection_round,
+        len(evidence),
+        len(conflicts),
+    )
+    return update
+
+
+def reflection_pre(state: dict) -> dict:
+    """通用反思（pre_answer）：先评估证据状态。"""
+    return _reflect(state, stage="pre_answer")
+
+
+def reflection_post(state: dict) -> dict:
+    """通用反思（post_answer）：评估回答草稿质量。"""
+    return _reflect(state, stage="post_answer")
+
+
+def doc_grader(state: dict) -> dict:
+    """兼容壳层：内部委托给 pre_answer 通用反思。"""
+    return reflection_pre(state)
+
+
+# ---------------------------------------------------------------------------
+# M7-T6: AnswerComposer — 回答组装
+# ---------------------------------------------------------------------------
+
+def answer_composer(state: dict) -> dict:
+    """调 LLM 基于 evidence 组装带引用的回答。"""
+    question = _effective_question(state)
+    max_evidence_chunks = _budget_int(state, "max_evidence_chunks", 8)
+    evidence = list(state.get("evidence", []))[:max_evidence_chunks]
+    locale = state.get("locale", "zh-CN")
+    request_id = state.get("request_id", "unknown")
+    direct_mode = (
+        str(state.get("retrieval_policy", "")).strip() == "none"
+        or str(state.get("_route_decision", "")).strip() == "answer_direct"
+    )
+
+    if not evidence:
+        if direct_mode:
+            user_prompt = prompts.DIRECT_ANSWER_USER.format(
+                question=question,
+                locale=locale,
+                conversation_context=_conversation_context_from_state(state),
+                time_budget=_time_budget_prompt(state),
+            )
+            profile = _select_model_profile(
+                state,
+                "composing",
+                node_name="direct_answer",
+                require_json=False,
+                fallback_tier="low",
+            )
+            compose_error: dict[str, str] | None = None
+            try:
+                answer_text = _call_llm_with_retry(
+                    prompts.DIRECT_ANSWER_SYSTEM,
+                    user_prompt,
+                    **_profile_kwargs(profile),
+                    max_attempts=2,
+                )
+                llm_trace_update = _llm_update_for_call(
+                    state,
+                    node_name="direct_answer",
+                    call_kind="business_text",
+                    profile=profile,
+                )
+            except Exception as exc:
+                answer_text = _DIRECT_ANSWER_FALLBACK_TEXT
+                llm_trace_update = {}
+                compose_error = {
+                    "type": exc.__class__.__name__,
+                    "message": str(exc)[:280],
+                }
+                logger.warning(
+                    "direct_answer failed request_id=%s type=%s msg=%s",
+                    request_id,
+                    compose_error["type"],
+                    compose_error["message"],
+                )
+
+            response = {
+                "request_id": request_id,
+                "text": answer_text,
+                "citations": [],
+                "answer_mode": "direct",
+            }
+            if compose_error:
+                response["trace_summary"] = (
+                    f"direct_answer_error={compose_error['type']}: {compose_error['message']}"
+                )
+            update: dict[str, Any] = {
+                "_final_response": response,
+                "_direct_answer": True,
+                **llm_trace_update,
+            }
+            if compose_error:
+                update["_compose_error"] = compose_error
+            else:
+                logger.debug(
+                    "direct_answer success request_id=%s chars=%d",
+                    request_id,
+                    len(answer_text),
+                )
+            return update
+
+        return {
+            "_final_response": {
+                "request_id": request_id,
+                "text": "当前知识库没有检索到足够证据，暂时不能给出可靠结论。请换一个更具体的关键词，或补充你想查的协议、工具、版本或报错信息。",
+                "citations": [],
+            },
+            "_terminal_insufficient_evidence": True,
+        }
+
+    evidence_block = ""
+    for i, ev in enumerate(evidence[:10], start=1):
+        evidence_block += (
+            f"\n--- 证据 [{i}] ---\n"
+            f"来源: {ev.get('source', '?')}\n"
+            f"标题: {ev.get('title', '?')}\n"
+            f"URL: {ev.get('url', '')}\n"
+            f"锚点: {ev.get('anchor', '')}\n"
+            f"内容: {ev.get('snippet', '')}\n"
+        )
+
+    user_prompt = prompts.ANSWER_COMPOSER_USER.format(
+        question=question,
+        locale=locale,
+        conversation_context=_conversation_context_from_state(state),
+        evidence_block=evidence_block or "(无可用证据)",
+        time_budget=_time_budget_prompt(state),
+    )
+    reflection_hints = state.get("reflection_hints", {})
+    if isinstance(reflection_hints, dict):
+        revise_instructions = str(reflection_hints.get("revise_instructions", "")).strip()
+        if revise_instructions:
+            user_prompt += f"\n\n反思改写要求:\n{revise_instructions}"
+
+    profile = _select_model_profile(
+        state,
+        "composing",
+        node_name="answer_composer",
+        require_json=False,
+        fallback_tier="medium",
+    )
+    compose_error: dict[str, str] | None = None
+    try:
+        answer_text = _call_llm_with_retry(
+            prompts.ANSWER_COMPOSER_SYSTEM,
+            user_prompt,
+            **_profile_kwargs(profile),
+            max_attempts=2,
+        )
+        llm_trace_update = _llm_update_for_call(
+            state,
+            node_name="answer_composer",
+            call_kind="business_text",
+            profile=profile,
+        )
+    except Exception as exc:
+        answer_text = _ANSWER_COMPOSER_FALLBACK_TEXT
+        llm_trace_update = {}
+        compose_error = {
+            "type": exc.__class__.__name__,
+            "message": str(exc)[:280],
+        }
+        logger.warning(
+            "answer_composer failed request_id=%s type=%s msg=%s",
+            request_id,
+            compose_error["type"],
+            compose_error["message"],
+        )
+
+    citations = []
+    for i, ev in enumerate(evidence[:10], start=1):
+        citations.append({
+            "label": f"[{i}]",
+            "url": ev.get("url", ""),
+            "anchor": ev.get("anchor", ""),
+            "title": ev.get("title", ""),
+        })
+
+    response = {
+        "request_id": request_id,
+        "text": answer_text,
+        "citations": citations,
+    }
+    if compose_error:
+        response["trace_summary"] = (
+            f"answer_composer_error={compose_error['type']}: {compose_error['message']}"
+        )
+
+    update: dict[str, Any] = {"_final_response": response, **llm_trace_update}
+    if compose_error:
+        update["_compose_error"] = compose_error
+    else:
+        logger.debug(
+            "answer_composer success request_id=%s chars=%d citations=%d",
+            request_id,
+            len(answer_text),
+            len(citations),
+        )
+    return update
+
+
+# ---------------------------------------------------------------------------
+# M7-T7: SelfCheck — 自检
+# ---------------------------------------------------------------------------
+
+def self_check(state: dict) -> dict:
+    """兼容壳层：内部委托给 post_answer 通用反思。"""
+    return reflection_post(state)
+
+
+# ---------------------------------------------------------------------------
+# M7-T8: FormatRepair — 格式修复
+# ---------------------------------------------------------------------------
+
+def format_repair(state: dict) -> dict:
+    """调用 normalizer 的 4 个函数做流水线清洗。"""
+    response = state.get("_final_response", {})
+
+    is_valid, errors = validate_response_shape(response)
+    if not is_valid:
+        response.setdefault("request_id", state.get("request_id", "unknown"))
+        response.setdefault("text", "")
+        response.setdefault("citations", [])
+
+    # 后回答反思超过轮次上限时，附加不确定性提示，避免“静默通过”。
+    max_post_rounds = _budget_int(state, "max_reflection_rounds_post", 2)
+    post_rounds = _int_like(state.get("_reflection_rounds_post", 0))
+    reflection_decision = str(state.get("reflection_decision", ""))
+    if (
+        post_rounds >= max_post_rounds
+        and reflection_decision in {"revise_answer", "continue_retrieval"}
+    ):
+        note = "\n\n注：当前回答存在不确定性，建议补充更多上下文后再确认。"
+        text_now = str(response.get("text", "") or "")
+        if note.strip() not in text_now:
+            response["text"] = text_now + note
+
+    text = response.get("text", "")
+    citations = response.get("citations", [])
+
+    text = sanitize_markdown(text)
+    text, citations = normalize_citations(text, citations)
+    text = _append_reference_section(text, citations)
+
+    response["text"] = text
+    response["citations"] = citations
+    tool_summary = str(state.get("_tool_execution_summary", "") or "").strip()
+    if tool_summary:
+        response["trace_summary"] = _merge_trace_summary(
+            str(response.get("trace_summary", "") or ""),
+            tool_summary,
+        )
+    user_msg = state.get("user_message", {})
+    context = {}
+    if isinstance(user_msg, dict) and isinstance(user_msg.get("context"), dict):
+        context = dict(user_msg["context"])
+    context.setdefault("platform", "discord")
+    context.setdefault("user_id", "unknown_user")
+
+    render_mode = str(state.get("render_mode", "markdown"))
+    if render_mode not in ("markdown", "plain"):
+        render_mode = "markdown"
+    reply_to = (
+        str(user_msg.get("reply_to_message_id"))
+        if isinstance(user_msg, dict) and user_msg.get("reply_to_message_id")
+        else None
+    )
+    if reply_to is None and isinstance(user_msg, dict):
+        context_platform = ""
+        if isinstance(user_msg.get("context"), dict):
+            context_platform = str(user_msg["context"].get("platform", "") or "")
+        if context_platform == "telegram" and user_msg.get("message_id"):
+            reply_to = str(user_msg.get("message_id"))
+    append_csat = bool(state.get("append_csat", False))
+
+    try:
+        outbound = format_response_to_outbound(
+            response=response,
+            context=context,  # type: ignore[arg-type]
+            render_mode=render_mode,  # type: ignore[arg-type]
+            append_csat=append_csat,
+            reply_to_message_id=reply_to,
+        )
+        response["_chunks"] = [seg.get("text", "") for seg in outbound.get("segments", [])]
+        return {"_final_response": response, "_outbound_message": outbound}
+    except Exception:
+        # Fallback to old behavior to keep runtime resilient.
+        chunks = chunk_for_platform(text, max_chars=2000)
+        response["_chunks"] = chunks
+        return {"_final_response": response}
+
+
+# ---------------------------------------------------------------------------
+# AskUser — 反问用户 (复用 M3 逻辑，升级为使用 info_needs)
+# ---------------------------------------------------------------------------
+
+def ask_user(state: dict) -> dict:
+    """当 InfoGapAssessor 判断需要反问时，生成反问回答。"""
+    info_needs = _normalize_info_needs_schema(state.get("info_needs", []))
+    request_id = state.get("request_id", "unknown")
+    checkpoint_id: str | None = None
+
+    question = "请问您能提供更多信息吗？"
+    reflection_hints = state.get("reflection_hints", {})
+    if isinstance(reflection_hints, dict):
+        hinted_question = str(reflection_hints.get("clarify_question", "")).strip()
+        if hinted_question:
+            question = hinted_question
+
+    if not (isinstance(reflection_hints, dict) and str(reflection_hints.get("clarify_question", "")).strip()):
+        for need in info_needs:
+            if need.get("required", False):
+                question = need.get("question", question)
+                break
+
+    has_required_question = bool(_required_questions(info_needs))
+    has_concrete_reflection_question = (
+        isinstance(reflection_hints, dict)
+        and _reflection_has_user_required_clarification(info_needs, reflection_hints)
+    )
+    if not has_required_question and not has_concrete_reflection_question:
+        question = (
+            "我不需要你补充版本或环境；我会先按默认 testnet、本地或云端自建 Fiber 节点、"
+            "小额热钱包、最小可行 agent 工具封装来推进。"
+        )
+        guard_reason = "ask_user_without_required_info"
+    else:
+        guard_reason = ""
+    if not guard_reason:
+        question = _normalize_ask_user_question(question)
+
+    # 写入线程 checkpoint，支持用户补参后恢复。
+    svc = state.get("_memory_service")
+    context = _get_message_context(state)
+    thread_key = _thread_key_from_context(context)
+    origin_question = _effective_question(state)
+    if svc is not None and thread_key is not None:
+        try:
+            checkpoint_id = svc.suspend_thread(
+                key=thread_key,
+                missing_params=_collect_missing_params(info_needs),
+                resume_node="retriever_planner",
+                context_payload={
+                    "origin_question": origin_question,
+                    "ask_user_question": question,
+                },
+            )
+        except Exception:
+            checkpoint_id = None
+
+    response = {
+        "request_id": request_id,
+        "text": question,
+        "citations": [],
+        "need_user_input": True,
+        "ask_user_question": question,
+    }
+    if checkpoint_id:
+        response["trace_summary"] = f"thread_checkpoint={checkpoint_id}"
+    if guard_reason:
+        response["need_user_input"] = False
+        response["ask_user_guard_reason"] = guard_reason
+
+    logger.info(
+        "ask_user request_id=%s question=%s checkpoint=%s",
+        request_id,
+        question,
+        checkpoint_id or "-",
+    )
+    update = {"_final_response": response}
+    if guard_reason:
+        update["_ask_user_guard_reason"] = guard_reason
+    return update
+

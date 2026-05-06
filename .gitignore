@@ -1,0 +1,41 @@
+.pytest_cache/
+.DS_Store
+.codex
+docs/
+report/
+
+# Local secrets and machine-specific runtime config
+config.yaml
+.env
+.env.*
+*.key
+*.pem
+
+# Python/runtime caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+
+# Local logs, chat records, feedback, and bot memory
+logs/
+*.log
+data/logs/
+data/telegram_bot/
+data/discord_bot/
+data/product_demo/
+data/tmp/
+data/tmp*.db
+
+# Temporary/debug vector stores
+*.lock
+data/qdrant_local_tmp_debug*/
+
+# Keep crawler/runtime data that is intentionally versioned:
+# - data/archive.db
+# - data/forum_talk/archive.db
+# - data/sources/github_docs.jsonl
+# - data/qdrant_local/**
+# - data/qdrant_talk_forum/**
+# - data/samples/**

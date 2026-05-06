@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nervos_brain"
+version = "0.1.0"
+description = "Nervos Brain Agentic RAG Engine"
+dependencies = [
+  "qdrant-client>=1.10.1",
+  "sqlalchemy>=2.0.0",
+  "litellm>=1.40.0",
+  "langgraph>=0.2.0",
+  "pyyaml>=6.0",
+  "rank-bm25>=0.2.2",
+  "requests>=2.31.0",
+  "discord.py>=2.4.0",
+]
+
+# 这是给咱们的质检机器人 pytest 专门看的地图
+[tool.pytest.ini_options]
+pythonpath = [
+  "src"
+]
+markers = [
+  "integration: hits the real Nervos Talk API; run with -m integration",
+]

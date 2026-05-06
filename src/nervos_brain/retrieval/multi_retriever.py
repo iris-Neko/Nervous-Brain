@@ -1,0 +1,309 @@
+"""Multi-path retrieval orchestrator.
+
+Pipeline (mirrors the design spec):
+  1. Vector search  — semantic recall via Qdrant shallow index
+  2. BM25 search    — keyword / term recall via in-memory BM25 index
+  3. Fuzzy match    — naming variants, abbreviations, typos
+  4. Exact match    — hard anchors: function names, class names, titles
+  5. RRF fusion     — merge ranked lists with Reciprocal Rank Fusion
+  6. Evidence hydration — attach full raw_text from the archive layer
+
+Each path is independently gated by the corresponding ``enable_*`` flag in
+RetrievalConfig, so you can turn off any path without touching the code.
+"""
+from __future__ import annotations
+
+import time
+from typing import Dict, List, Optional
+
+from nervos_brain.core_protocols import Evidence
+
+from .bm25_index import BM25Index
+from .config import RetrievalConfig, load_retrieval_config
+from .dual_layer import ArchiveRecord, ArchiveStore
+from .embedding import get_embedding
+from .evidence_adapter import qdrant_result_to_evidence
+from .fuzzy_search import fuzzy_search
+from .qdrant_writer import QdrantStore
+from .rank_fusion import FusedResult, reciprocal_rank_fusion
+from .search import _build_filter_must
+
+
+class MultiRetriever:
+    """Orchestrate all retrieval paths and return fused Evidence.
+
+    Usage
+    -----
+    retriever = MultiRetriever(qdrant_store, archive_store)
+    # on first use (or after new data is ingested) build the BM25 index:
+    retriever.rebuild_bm25()
+    # then query:
+    evidence = retriever.search("how to open a Fiber channel?", filters={"topic": "fiber"})
+    """
+
+    def __init__(
+        self,
+        qdrant_store: QdrantStore | None = None,
+        archive_store: ArchiveStore | None = None,
+        config: RetrievalConfig | None = None,
+    ) -> None:
+        self._cfg = config or load_retrieval_config()
+        self._qdrant = qdrant_store or QdrantStore(
+            config=self._cfg, qdrant_location=self._cfg.qdrant_path
+        )
+        self._archive = archive_store or ArchiveStore(config=self._cfg)
+        self._bm25 = BM25Index()
+
+    # ── index management ───────────────────────────────────────────────────
+
+    def rebuild_bm25(self) -> int:
+        """Rebuild the BM25 index from the current archive contents."""
+        self._bm25.build_from_store(self._archive)
+        return self._bm25.size
+
+    # ── main search entry point ────────────────────────────────────────────
+
+    def search(
+        self,
+        query: str,
+        filters: Optional[Dict[str, str]] = None,
+        top_k: Optional[int] = None,
+    ) -> List[Evidence]:
+        """Run all enabled retrieval paths, fuse, and return Evidence.
+
+        Args:
+            query:    Natural-language query or hard symbol (e.g. ``OpenChannel``).
+            filters:  Qdrant payload filters applied to the vector path.
+                      Must be provided (non-empty) to enable vector search;
+                      if omitted, only BM25/fuzzy/exact paths run.
+            top_k:    Override ``config.final_top_k``.
+        """
+        cfg = self._cfg
+        final_top_k = top_k or cfg.final_top_k
+        per_path_k = cfg.top_k_per_path
+
+        ranked_lists: List[List[dict]] = []
+        path_names: List[str] = []
+
+        # ── 1. Vector search ───────────────────────────────────────────────
+        if filters:
+            vec_results = self._vector_search(query, filters, per_path_k)
+            ranked_lists.append(vec_results)
+            path_names.append("vector")
+
+        # ── 2. BM25 keyword search ─────────────────────────────────────────
+        if cfg.enable_bm25 and self._bm25.size > 0:
+            bm25_results = self._bm25_search(query, per_path_k, filters)
+            ranked_lists.append(bm25_results)
+            path_names.append("bm25")
+
+        # ── 3. Fuzzy match ─────────────────────────────────────────────────
+        if cfg.enable_fuzzy:
+            fuzzy_results = self._fuzzy_search(
+                query, per_path_k, cfg.fuzzy_threshold, filters
+            )
+            if fuzzy_results:
+                ranked_lists.append(fuzzy_results)
+                path_names.append("fuzzy")
+
+        # ── 4. Exact match ─────────────────────────────────────────────────
+        if cfg.enable_exact:
+            exact_results = self._exact_search(query, per_path_k, filters)
+            if exact_results:
+                ranked_lists.append(exact_results)
+                path_names.append("exact")
+
+        if not ranked_lists:
+            return []
+
+        # ── 5. RRF fusion ──────────────────────────────────────────────────
+        fused = reciprocal_rank_fusion(
+            ranked_lists, k=cfg.rrf_k, path_names=path_names
+        )[:final_top_k]
+
+        # ── 6. Hydrate Evidence with archive raw_text ──────────────────────
+        return [self._to_evidence(r) for r in fused]
+
+    # ── private path implementations ───────────────────────────────────────
+
+    def _vector_search(
+        self, query: str, filters: Dict[str, str], top_k: int
+    ) -> List[dict]:
+        query_vec = get_embedding(query, self._cfg)
+        query_filter = _build_filter_must(filters)
+        try:
+            response = self._qdrant.client.query_points(
+                collection_name=self._qdrant.config.collection_name,
+                query=query_vec,
+                query_filter=query_filter,
+                limit=top_k,
+            )
+            return [
+                {
+                    "anchor": r.payload.get("anchor", ""),
+                    "title": r.payload.get("title", ""),
+                    "source": r.payload.get("source", ""),
+                    "score": float(r.score or 0.0),
+                    "payload": dict(r.payload),
+                    "qdrant_id": str(r.id),
+                }
+                for r in response.points
+                if r.payload
+            ]
+        except Exception:
+            return []
+
+    def _bm25_search(
+        self, query: str, top_k: int, filters: Optional[Dict[str, str]] = None
+    ) -> List[dict]:
+        if filters:
+            records = [
+                record
+                for record in self._archive.list_all()
+                if self._record_matches_filters(record, filters)
+            ]
+            if not records:
+                return []
+            index = BM25Index()
+            index.build(records)
+            hits = index.search(query, top_k=top_k)
+        else:
+            hits = self._bm25.search(query, top_k=top_k)
+        return [
+            {
+                "anchor": h.anchor,
+                "title": h.title,
+                "source": h.source,
+                "score": h.score,
+            }
+            for h in hits
+        ]
+
+    def _record_matches_filters(self, record: ArchiveRecord, filters: Dict[str, str]) -> bool:
+        if not filters:
+            return True
+        payload = {
+            "source": record.source,
+            "type": record.doc_type,
+            "doc_type": record.doc_type,
+            "version": record.version,
+            "lang": record.lang,
+            "url": record.url,
+            "anchor": record.anchor,
+            "topic": record.topic,
+            "title": record.title,
+            "keywords": record.keywords,
+        }
+        for key, expected in filters.items():
+            if expected in (None, ""):
+                continue
+            actual = payload.get(str(key), "")
+            if str(actual) != str(expected):
+                return False
+        return True
+
+    def _fuzzy_search(
+        self, query: str, top_k: int, threshold: float, filters: Optional[Dict[str, str]] = None
+    ) -> List[dict]:
+        # Build candidate list from archive (titles + keywords only, cheap)
+        candidates = [
+            {
+                "anchor": r.anchor,
+                "title": r.title,
+                "source": r.source,
+                "keywords": r.keywords,
+            }
+            for r in self._archive.list_all()
+            if self._record_matches_filters(r, filters or {})
+        ]
+        hits = fuzzy_search(query, candidates, threshold=threshold, top_k=top_k)
+        return [
+            {
+                "anchor": h.anchor,
+                "title": h.title,
+                "source": h.source,
+                "score": h.score,
+            }
+            for h in hits
+        ]
+
+    def _exact_search(
+        self, query: str, top_k: int, filters: Optional[Dict[str, str]] = None
+    ) -> List[dict]:
+        """Exact-match against title, keywords, and anchor fields in Qdrant.
+
+        Used for hard anchors like function names, class names, file paths.
+        Tries three payload fields in order; merges and deduplicates.
+        """
+        from qdrant_client.models import FieldCondition, Filter, MatchText
+
+        results: List[dict] = []
+        seen: set[str] = set()
+
+        for field_name in ("title", "keywords", "anchor"):
+            try:
+                cond = Filter(
+                    must=[FieldCondition(key=field_name, match=MatchText(text=query))]
+                )
+                resp = self._qdrant.client.scroll(
+                    collection_name=self._qdrant.config.collection_name,
+                    scroll_filter=cond,
+                    limit=top_k,
+                    with_payload=True,
+                )
+                for point in resp[0]:
+                    payload = dict(point.payload or {})
+                    if filters:
+                        matched = True
+                        for key, expected in filters.items():
+                            if expected in (None, ""):
+                                continue
+                            if str(payload.get(str(key), "")) != str(expected):
+                                matched = False
+                                break
+                        if not matched:
+                            continue
+                    anchor = payload.get("anchor", "")
+                    if anchor and anchor not in seen:
+                        seen.add(anchor)
+                        results.append(
+                            {
+                                "anchor": anchor,
+                                "title": payload.get("title", ""),
+                                "source": payload.get("source", ""),
+                                "score": 1.0,  # exact match = max score
+                            }
+                        )
+            except Exception:
+                continue
+
+        return results[:top_k]
+
+    def _to_evidence(self, fused: FusedResult) -> Evidence:
+        """Convert a FusedResult to the protocol Evidence TypedDict.
+
+        Tries to fetch the full raw_text from the archive for the snippet.
+        Falls back to whatever is available in the Qdrant payload.
+        """
+        archive_rec = self._archive.get_by_anchor(fused.anchor)
+        snippet = ""
+        url = "unknown"
+        if archive_rec:
+            snippet = archive_rec.raw_text[:1200]
+            url = archive_rec.url
+
+        return {
+            "id": fused.anchor,
+            "source": fused.source or "multi",
+            "title": fused.title,
+            "url": url,
+            "anchor": fused.anchor,
+            "snippet": snippet,
+            "score": fused.rrf_score,
+            "payload": {
+                "rrf_score": str(fused.rrf_score),
+                **{f"contrib_{k}": str(v) for k, v in fused.contributions.items()},
+            },
+            "hash": "",
+            "retrieved_ts_ms": int(time.time() * 1000),
+        }

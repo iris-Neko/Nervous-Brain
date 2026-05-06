@@ -1,0 +1,1306 @@
+"""M7-T13/T14/T15: 三大场景测试 (mock LLM, 不依赖 API key)。"""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import patch
+
+import pytest
+
+
+def _make_state(**overrides):
+    """构造最小 FullGraphState。"""
+    base = {
+        "request_id": "test-req-001",
+        "user_message": {"content": "test question"},
+        "user_memory_key": {"platform": "discord", "user_id": "u1"},
+        "memory_pointers": [],
+        "memory_facts": [],
+        "info_needs": [],
+        "evidence": [],
+        "conflicts": [],
+        "retry_count": 0,
+        "budget": {
+            "max_prompt_tokens": 4000,
+            "max_evidence_chunks": 10,
+            "max_memory_facts": 5,
+            "max_tool_calls": 3,
+        },
+        "route": "graph",
+        "locale": "zh-CN",
+    }
+    base.update(overrides)
+    return base
+
+
+# -----------------------------------------------------------------------
+# Mock call_llm helpers
+# -----------------------------------------------------------------------
+
+_LLM_CALL_LOG: list[tuple[str, str]] = []
+
+
+def _mock_call_llm_factory(responses: dict[str, str]):
+    """创建一个根据 system prompt 关键词返回预设响应的 mock。"""
+
+    def _mock_call_llm(system_prompt, user_prompt, *, json_mode=False, model=None, temperature=0.3, max_tokens=2048):
+        _LLM_CALL_LOG.append((system_prompt[:50], user_prompt[:50]))
+        for keyword, response in responses.items():
+            if keyword in system_prompt:
+                return response
+        return '{"decision": "has_needs", "info_needs": []}'
+
+    return _mock_call_llm
+
+
+def _mock_call_llm_json_factory(responses: dict[str, dict]):
+    """创建根据 system prompt 关键词返回预设 JSON 的 mock。"""
+
+    def _mock_call_llm_json(system_prompt, user_prompt, *, model=None):
+        for keyword, response in responses.items():
+            if keyword in system_prompt:
+                return response
+        return {"decision": "has_needs", "info_needs": []}
+
+    return _mock_call_llm_json
+
+
+# -----------------------------------------------------------------------
+# M7-T13: "Invalid capacity" 场景 — 缺 SDK 语言，走 AskUser
+# -----------------------------------------------------------------------
+
+class TestInvalidCapacityScenario:
+    """构造缺 SDK 语言的输入，验证走 AskUser 路径。"""
+
+    def test_ask_user_path(self):
+        from nervos_brain.graph_engine.full_graph import build_full_graph
+
+        mock_llm_responses = {
+            "信息缺口评估": json.dumps({
+                "decision": "ask_user",
+                "info_needs": [
+                    {
+                        "kind": "missing_param",
+                        "question": "请问您使用的是哪种 SDK 语言？（JavaScript/Rust/Go）",
+                        "required": True,
+                    }
+                ],
+                "reasoning": "用户没有指定 SDK 语言，无法提供对应代码示例",
+            }),
+        }
+
+        mock_json_responses = {
+            "信息缺口评估": {
+                "decision": "ask_user",
+                "info_needs": [
+                    {
+                        "kind": "missing_param",
+                        "question": "请问您使用的是哪种 SDK 语言？（JavaScript/Rust/Go）",
+                        "required": True,
+                    }
+                ],
+                "reasoning": "用户没有指定 SDK 语言，无法提供对应代码示例",
+            },
+        }
+
+        state = _make_state(
+            user_message={"content": "怎么用 SDK 发交易？"},
+        )
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm",
+                    _mock_call_llm_factory(mock_llm_responses)), \
+             patch("nervos_brain.graph_engine.full_nodes.call_llm_json",
+                    _mock_call_llm_json_factory(mock_json_responses)):
+            graph = build_full_graph()
+            result = graph.invoke(state)
+
+        response = result.get("_final_response", {})
+        assert response.get("need_user_input") is True
+        assert "SDK" in response.get("ask_user_question", "") or "SDK" in response.get("text", "")
+
+
+# -----------------------------------------------------------------------
+# M7-T14: "Fiber 开通道" 场景 — 有证据，走 AnswerComposer
+# -----------------------------------------------------------------------
+
+class TestFiberChannelScenario:
+    """构造带 evidence 的输入，验证走 AnswerComposer 并输出引用。"""
+
+    def test_answer_with_citations(self):
+        from nervos_brain.graph_engine.full_graph import build_full_graph
+
+        mock_evidence = [
+            {
+                "id": "ev-001",
+                "source": "qdrant",
+                "title": "Fiber Channel Open API",
+                "url": "https://docs.nervos.org/fiber/channel",
+                "anchor": "section:open-channel",
+                "snippet": "调用 open_channel() 方法，传入对方节点 ID 和初始容量即可开通 Fiber 支付通道。",
+                "score": 0.92,
+                "payload": {"source": "rfcs", "type": "doc", "version": "0.3"},
+                "hash": "abc123",
+                "retrieved_ts_ms": 1700000000000,
+            },
+            {
+                "id": "ev-002",
+                "source": "github",
+                "title": "fiber-sdk-js/examples/channel.ts",
+                "url": "https://github.com/nervosnetwork/fiber-sdk-js/blob/main/examples/channel.ts",
+                "anchor": "L15-L30",
+                "snippet": "const channel = await fiber.openChannel({ peerId, capacity: '1000000000' });",
+                "score": 0.88,
+                "payload": {"source": "github", "type": "code", "version": "0.3"},
+                "hash": "def456",
+                "retrieved_ts_ms": 1700000000000,
+            },
+        ]
+
+        mock_llm_responses = {
+            "信息缺口评估": json.dumps({
+                "decision": "has_needs",
+                "info_needs": [
+                    {"kind": "concept_gap", "question": "Fiber 开通道的 API", "required": False}
+                ],
+            }),
+            "检索规划": json.dumps({
+                "plan_id": "plan_test",
+                "rationale": "search for Fiber channel open",
+                "steps": [{"step_id": "step_1", "tool": "qdrant_search", "query": "Fiber open channel", "filters": {"source": "rfcs"}, "top_k": 5}],
+                "parallel_groups": [["step_1"]],
+                "budget": {"max_tool_calls": 3},
+            }),
+            "证据评分": json.dumps({"grade": "enough", "reasoning": "证据覆盖了核心问题"}),
+            "回答组装": f"使用 Fiber SDK 开通支付通道需要调用 `open_channel()` 方法 [1]。\n\n```typescript\nconst channel = await fiber.openChannel({{ peerId, capacity: '1000000000' }});\n``` [2]\n",
+            "自检": json.dumps({"pass": True, "issues": [], "reasoning": "引用完整，格式正确"}),
+        }
+
+        mock_json_responses = {
+            "信息缺口评估": {
+                "decision": "has_needs",
+                "info_needs": [
+                    {"kind": "concept_gap", "question": "Fiber 开通道的 API", "required": False}
+                ],
+            },
+            "检索规划": {
+                "plan_id": "plan_test",
+                "rationale": "search for Fiber channel open",
+                "steps": [{"step_id": "step_1", "tool": "qdrant_search", "query": "Fiber open channel", "filters": {"source": "rfcs"}, "top_k": 5}],
+                "parallel_groups": [["step_1"]],
+                "budget": {"max_tool_calls": 3},
+            },
+            "证据评分": {"grade": "enough", "reasoning": "证据覆盖了核心问题"},
+            "自检": {"pass": True, "issues": [], "reasoning": "引用完整，格式正确"},
+        }
+
+        state = _make_state(
+            user_message={"content": "怎么用 Fiber SDK 开通支付通道？"},
+            evidence=mock_evidence,
+        )
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm",
+                    _mock_call_llm_factory(mock_llm_responses)), \
+             patch("nervos_brain.graph_engine.full_nodes.call_llm_json",
+                    _mock_call_llm_json_factory(mock_json_responses)):
+            graph = build_full_graph()
+            result = graph.invoke(state)
+
+        response = result.get("_final_response", {})
+        assert response.get("text"), "回答文本不应为空"
+        assert response.get("citations"), "应该包含引用"
+        assert not response.get("need_user_input", False), "不应该要求用户补充信息"
+
+
+class TestDirectAnswerScenario:
+    """低风险 answer_direct 应短路径直答，不检索、不追加来源。"""
+
+    def test_full_graph_direct_answer_skips_retrieval_and_self_check(self):
+        from nervos_brain.graph_engine.full_graph import build_full_graph
+
+        call_counter = {"info_gap": 0, "direct": 0, "planner": 0, "self_check": 0}
+
+        def mock_call_llm_json(system_prompt, user_prompt, *, model=None):
+            _ = user_prompt, model
+            if "信息缺口评估" in system_prompt:
+                call_counter["info_gap"] += 1
+                return {
+                    "decision": "answer_direct",
+                    "retrieval_policy": "none",
+                    "info_needs": [],
+                    "reasoning": "identity/help question",
+                }
+            if "检索规划" in system_prompt:
+                call_counter["planner"] += 1
+            if "自检" in system_prompt:
+                call_counter["self_check"] += 1
+            return {"decision": "accept_answer", "uncertainty_score": 0.1}
+
+        def mock_call_llm(system_prompt, user_prompt, *, json_mode=False, model=None, temperature=0.3, max_tokens=2048):
+            _ = user_prompt, json_mode, model, temperature, max_tokens
+            if "直接回答器" in system_prompt:
+                call_counter["direct"] += 1
+                return "我是 Nervos Brain，可以帮你回答 Nervos/CKB/Fiber/CCC 相关问题。"
+            return ""
+
+        state = _make_state(user_message={"content": "你是谁"})
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm", mock_call_llm), \
+             patch("nervos_brain.graph_engine.full_nodes.call_llm_json", mock_call_llm_json):
+            graph = build_full_graph()
+            result = graph.invoke(state)
+
+        response = result.get("_final_response", {})
+        assert call_counter["info_gap"] == 1
+        assert call_counter["direct"] == 1
+        assert call_counter["planner"] == 0
+        assert call_counter["self_check"] == 0
+        assert response.get("citations") == []
+        assert "参考来源" not in response.get("text", "")
+        assert result.get("_direct_answer") is True
+
+    def test_direct_answer_can_use_recent_conversation_context(self):
+        from nervos_brain.graph_engine.full_graph import build_full_graph
+
+        captured: dict[str, str] = {}
+
+        def mock_call_llm_json(system_prompt, user_prompt, *, model=None):
+            _ = model
+            if "信息缺口评估" in system_prompt:
+                captured["info_gap_user_prompt"] = user_prompt
+                return {
+                    "decision": "answer_direct",
+                    "retrieval_policy": "none",
+                    "info_needs": [],
+                    "reasoning": "context follow-up",
+                }
+            return {"decision": "accept_answer", "uncertainty_score": 0.1}
+
+        def mock_call_llm(system_prompt, user_prompt, *, json_mode=False, model=None, temperature=0.3, max_tokens=2048):
+            _ = system_prompt, json_mode, model, temperature, max_tokens
+            captured["direct_user_prompt"] = user_prompt
+            return "你刚才问的是：CKB 是什么。"
+
+        state = _make_state(
+            user_message={"content": "你看看上文是什么"},
+            recent_messages=[
+                {"role": "user", "content": "CKB 是什么", "created_ts_ms": 1000},
+                {"role": "assistant", "content": "CKB 是 Nervos 的底层公链。", "created_ts_ms": 1100},
+            ],
+        )
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm", mock_call_llm), \
+             patch("nervos_brain.graph_engine.full_nodes.call_llm_json", mock_call_llm_json):
+            result = build_full_graph().invoke(state)
+
+        assert "CKB 是什么" in captured["info_gap_user_prompt"]
+        assert "CKB 是什么" in captured["direct_user_prompt"]
+        assert "CKB 是什么" in result["_final_response"]["text"]
+
+
+class TestSingleRetrievalScenario:
+    """single policy 应最多做一轮轻量检索。"""
+
+    def test_single_retrieval_path_stops_after_one_hop(self):
+        from nervos_brain.graph_engine.full_graph import build_full_graph
+
+        call_counter = {"planner": 0, "pre": 0, "post": 0, "answer": 0}
+
+        def mock_call_llm_json(system_prompt, user_prompt, *, model=None):
+            _ = user_prompt, model
+            if "信息缺口评估" in system_prompt:
+                return {
+                    "decision": "has_needs",
+                    "retrieval_policy": "single",
+                    "info_needs": [{"kind": "concept_gap", "question": "CKB definition", "required": False}],
+                }
+            if "检索规划" in system_prompt:
+                call_counter["planner"] += 1
+                return {
+                    "plan_id": "p-single",
+                    "rationale": "one query",
+                    "steps": [
+                        {"step_id": "s1", "tool": "qdrant_search", "query": "CKB definition", "filters": {}, "top_k": 3},
+                        {"step_id": "s2", "tool": "github_search", "query": "CKB docs", "filters": {}, "top_k": 3},
+                        {"step_id": "s3", "tool": "discourse_query", "query": "CKB history", "filters": {}, "top_k": 3},
+                    ],
+                    "parallel_groups": [["s1", "s2", "s3"]],
+                    "budget": {"max_tool_calls": 3},
+                }
+            if "证据评分" in system_prompt:
+                call_counter["pre"] += 1
+                return {"decision": "accept_answer", "reasoning": "enough", "uncertainty_score": 0.2}
+            if "自检" in system_prompt:
+                call_counter["post"] += 1
+                return {"decision": "accept_answer", "reasoning": "ok", "uncertainty_score": 0.1}
+            return {}
+
+        def mock_call_llm(system_prompt, user_prompt, *, json_mode=False, model=None, temperature=0.3, max_tokens=2048):
+            _ = user_prompt, json_mode, model, temperature, max_tokens
+            if "回答组装" in system_prompt:
+                call_counter["answer"] += 1
+                return "CKB 是 Nervos 的 Layer 1 区块链 [1]。"
+            return ""
+
+        class FakeRetriever:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def search(self, query: str, filters=None, top_k: int = 5):
+                _ = query, filters, top_k
+                self.calls += 1
+                return [
+                    {
+                        "id": f"ev-{self.calls}",
+                        "source": "qdrant",
+                        "title": "CKB intro",
+                        "url": "https://example.com/ckb",
+                        "anchor": "doc",
+                        "snippet": "CKB is the layer-1 blockchain of Nervos.",
+                        "score": 0.9,
+                        "payload": {"source": "docs", "version": "v1"},
+                        "hash": f"h-{self.calls}",
+                        "retrieved_ts_ms": 1,
+                    }
+                ]
+
+        retriever = FakeRetriever()
+        state = _make_state(
+            user_message={"content": "ckb是什么"},
+            _multi_retriever=retriever,
+        )
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm", mock_call_llm), \
+             patch("nervos_brain.graph_engine.full_nodes.call_llm_json", mock_call_llm_json):
+            graph = build_full_graph()
+            result = graph.invoke(state)
+
+        assert call_counter["planner"] == 1
+        assert call_counter["pre"] == 1
+        assert call_counter["post"] == 1
+        assert call_counter["answer"] == 1
+        assert retriever.calls <= 2
+        assert result.get("hop_count") == 1
+        assert result.get("budget", {}).get("max_hops") == 1
+        assert result.get("_final_response", {}).get("text")
+
+    def test_retriever_planner_receives_recent_conversation_context(self):
+        from nervos_brain.graph_engine.full_nodes import retriever_planner
+
+        captured: dict[str, str] = {}
+
+        def mock_call_llm_json(system_prompt, user_prompt, *, model=None):
+            _ = system_prompt, model
+            captured["user_prompt"] = user_prompt
+            return {
+                "plan_id": "p-context",
+                "rationale": "use context",
+                "steps": [
+                    {"step_id": "s1", "tool": "qdrant_search", "query": "JS SDK CKB", "filters": {}, "top_k": 3}
+                ],
+                "parallel_groups": [["s1"]],
+                "budget": {"max_tool_calls": 1},
+            }
+
+        state = _make_state(
+            user_message={"content": "那 JS SDK 怎么写"},
+            retrieval_policy="single",
+            info_needs=[{"kind": "concept_gap", "question": "SDK 示例", "required": False}],
+            recent_messages=[
+                {"role": "user", "content": "我想写一个 CKB 转账示例", "created_ts_ms": 1}
+            ],
+        )
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm_json", mock_call_llm_json):
+            out = retriever_planner(state)
+
+        assert "我想写一个 CKB 转账示例" in captured["user_prompt"]
+        assert out["retrieval_plan"]["steps"][0]["query"] == "JS SDK CKB"
+
+
+# -----------------------------------------------------------------------
+# M7-T15: "证据冲突" 场景 — 构造 conflicts，DocGrader 触发 replan
+# -----------------------------------------------------------------------
+
+class TestEvidenceConflictScenario:
+    """构造 conflicts，验证 DocGrader 触发 replan (need_more)。"""
+
+    def test_conflict_triggers_replan(self):
+        from nervos_brain.graph_engine.full_nodes import doc_grader
+
+        conflict_evidence = [
+            {
+                "id": "ev-A", "source": "qdrant", "title": "Doc A",
+                "url": "https://a.com", "anchor": "s1",
+                "snippet": "Fiber 版本 0.2 的 API", "score": 0.9,
+                "payload": {"source": "rfcs", "type": "doc", "version": "0.2"},
+                "hash": "aaa", "retrieved_ts_ms": 1700000000000,
+            },
+            {
+                "id": "ev-B", "source": "qdrant", "title": "Doc B",
+                "url": "https://b.com", "anchor": "s2",
+                "snippet": "Fiber 版本 0.3 的 API 已完全改变", "score": 0.85,
+                "payload": {"source": "rfcs", "type": "doc", "version": "0.3"},
+                "hash": "bbb", "retrieved_ts_ms": 1700000000000,
+            },
+        ]
+
+        conflicts = [
+            {"a_id": "ev-A", "b_id": "ev-B", "reason": "version_mismatch"},
+        ]
+
+        state = _make_state(
+            user_message={"content": "Fiber 的 open_channel API 怎么用？"},
+            evidence=conflict_evidence,
+            conflicts=conflicts,
+        )
+
+        mock_json_responses = {
+            "证据评分": {"grade": "need_more", "reasoning": "证据版本冲突", "missing_aspects": ["需要确认最新版本"]},
+        }
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm_json",
+                    _mock_call_llm_json_factory(mock_json_responses)):
+            result = doc_grader(state)
+
+        assert result["_grade"] == "need_more"
+
+    def test_full_graph_conflict_triggers_replan_then_answer(self):
+        """完整图：冲突 -> replan -> 最终回答。"""
+        from nervos_brain.graph_engine.full_graph import build_full_graph
+
+        call_counter = {"info_gap": 0, "planner": 0, "grader": 0, "answer": 0, "self_check": 0}
+
+        def mock_call_llm_json(system_prompt, user_prompt, *, model=None):
+            if "信息缺口评估" in system_prompt:
+                call_counter["info_gap"] += 1
+                return {
+                    "decision": "has_needs",
+                    "info_needs": [{"kind": "concept_gap", "question": "Fiber API", "required": False}],
+                }
+            elif "检索规划" in system_prompt:
+                call_counter["planner"] += 1
+                return {
+                    "plan_id": f"plan_{call_counter['planner']}",
+                    "rationale": "replan search",
+                    "steps": [{"step_id": "step_1", "tool": "qdrant_search", "query": "Fiber", "filters": {}, "top_k": 5}],
+                    "parallel_groups": [["step_1"]],
+                    "budget": {"max_tool_calls": 3},
+                }
+            elif "证据评分" in system_prompt:
+                call_counter["grader"] += 1
+                if call_counter["grader"] <= 1:
+                    return {"grade": "need_more", "reasoning": "conflict", "missing_aspects": []}
+                return {"grade": "enough", "reasoning": "ok"}
+            elif "自检" in system_prompt:
+                call_counter["self_check"] += 1
+                return {"pass": True, "issues": [], "reasoning": "ok"}
+            return {}
+
+        def mock_call_llm(system_prompt, user_prompt, *, json_mode=False, model=None, temperature=0.3, max_tokens=2048):
+            if "回答组装" in system_prompt:
+                call_counter["answer"] += 1
+                return "Fiber 通道的正确用法是... [1]"
+            return json.dumps(mock_call_llm_json(system_prompt, user_prompt))
+
+        state = _make_state(
+            user_message={"content": "Fiber open_channel 怎么用？"},
+            evidence=[{
+                "id": "ev-1", "source": "qdrant", "title": "Fiber Doc",
+                "url": "https://fiber.com", "anchor": "s1",
+                "snippet": "open_channel API docs", "score": 0.9,
+                "payload": {"source": "rfcs", "type": "doc"},
+                "hash": "h1", "retrieved_ts_ms": 1700000000000,
+            }],
+            conflicts=[{"a_id": "ev-1", "b_id": "ev-2", "reason": "version_mismatch"}],
+        )
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm", mock_call_llm), \
+             patch("nervos_brain.graph_engine.full_nodes.call_llm_json", mock_call_llm_json):
+            graph = build_full_graph()
+            result = graph.invoke(state)
+
+        assert call_counter["grader"] >= 2, "DocGrader 应至少被调用两次（首次 need_more + 后续 enough）"
+        response = result.get("_final_response", {})
+        assert response.get("text"), "最终应产出回答"
+
+
+# -----------------------------------------------------------------------
+# 路由函数单元测试
+# -----------------------------------------------------------------------
+
+class TestRoutingFunctions:
+    """测试条件路由函数。"""
+
+    def test_route_after_assessment_ask_user(self):
+        from nervos_brain.graph_engine.full_graph import route_after_assessment
+        assert route_after_assessment({"_route_decision": "ask_user"}) == "ask_user"
+
+    def test_route_after_assessment_has_needs(self):
+        from nervos_brain.graph_engine.full_graph import route_after_assessment
+        assert route_after_assessment({"_route_decision": "has_needs"}) == "retriever_planner"
+
+    def test_route_after_assessment_answer_direct(self):
+        from nervos_brain.graph_engine.full_graph import route_after_assessment
+        assert route_after_assessment({"_route_decision": "answer_direct"}) == "answer_composer"
+
+    def test_route_after_answer_composer_direct_skips_self_check(self):
+        from nervos_brain.graph_engine.full_graph import route_after_answer_composer
+        assert route_after_answer_composer({"_direct_answer": True}) == "format_repair"
+
+    def test_route_after_answer_composer_evidence_answer_runs_self_check(self):
+        from nervos_brain.graph_engine.full_graph import route_after_answer_composer
+        assert route_after_answer_composer({}) == "self_check"
+
+    def test_route_after_grading_need_more(self):
+        from nervos_brain.graph_engine.full_graph import route_after_grading
+        assert route_after_grading({"_grade": "need_more", "retry_count": 0}) == "retriever_planner"
+
+    def test_route_after_grading_enough(self):
+        from nervos_brain.graph_engine.full_graph import route_after_grading
+        assert route_after_grading({"_grade": "enough"}) == "answer_composer"
+
+    def test_route_after_grading_exhausted(self):
+        from nervos_brain.graph_engine.full_graph import route_after_grading
+        assert route_after_grading({"_grade": "need_more", "retry_count": 3}) == "answer_composer"
+
+    def test_route_after_grading_exhausted_with_evidence_answers(self):
+        from nervos_brain.graph_engine.full_graph import route_after_grading
+
+        assert (
+            route_after_grading(
+                {
+                    "reflection_decision": "continue_retrieval",
+                    "hop_count": 3,
+                    "evidence": [{"id": "ev-1", "snippet": "CKB is a layer-1 blockchain."}],
+                    "budget": {"max_hops": 3, "max_reflection_rounds_pre": 2},
+                }
+            )
+            == "answer_composer"
+        )
+
+    def test_route_after_grading_exhausted_with_conflict_and_evidence_answers(self):
+        from nervos_brain.graph_engine.full_graph import route_after_grading
+
+        assert (
+            route_after_grading(
+                {
+                    "reflection_decision": "continue_retrieval",
+                    "hop_count": 3,
+                    "evidence": [{"id": "ev-1", "snippet": "Fiber setup docs"}],
+                    "conflicts": [{"a_id": "ev-1", "b_id": "ev-2", "reason": "version_mismatch"}],
+                    "info_needs": [
+                        {
+                            "kind": "latest_spec",
+                            "question": "继续检索 Fiber 官方文档",
+                            "required": False,
+                        }
+                    ],
+                    "budget": {"max_hops": 3, "max_reflection_rounds_pre": 2},
+                }
+            )
+            == "answer_composer"
+        )
+
+    def test_route_after_grading_exhausted_with_required_param_still_asks(self):
+        from nervos_brain.graph_engine.full_graph import route_after_grading
+
+        assert (
+            route_after_grading(
+                {
+                    "reflection_decision": "continue_retrieval",
+                    "hop_count": 3,
+                    "info_needs": [
+                        {
+                            "kind": "missing_param",
+                            "question": "请问你使用的是哪个 SDK？",
+                            "required": True,
+                        }
+                    ],
+                    "budget": {"max_hops": 3, "max_reflection_rounds_pre": 2},
+                }
+            )
+            == "ask_user"
+        )
+
+    def test_route_after_grading_exhausted_respects_required_need(self):
+        from nervos_brain.graph_engine.full_graph import route_after_grading
+
+        assert (
+            route_after_grading(
+                {
+                    "reflection_decision": "continue_retrieval",
+                    "hop_count": 3,
+                    "info_needs": [
+                        {
+                            "kind": "latest_spec",
+                            "question": "需要获取 Fiber 节点当前官方部署方式、配置项、运行命令、RPC/API 或管理接口等最新资料。",
+                            "required": True,
+                        }
+                    ],
+                    "evidence": [{"id": "ev-1", "snippet": "Fiber setup docs"}],
+                    "budget": {"max_hops": 3, "max_reflection_rounds_pre": 2},
+                }
+            )
+            == "ask_user"
+        )
+
+    def test_route_after_self_check_pass(self):
+        from nervos_brain.graph_engine.full_graph import route_after_self_check
+        assert route_after_self_check({"_self_check_pass": True}) == "format_repair"
+
+    def test_route_after_self_check_fail_retry(self):
+        from nervos_brain.graph_engine.full_graph import route_after_self_check
+        assert route_after_self_check({"_self_check_pass": False, "retry_count": 0}) == "answer_composer"
+
+    def test_route_after_self_check_fail_exhausted(self):
+        from nervos_brain.graph_engine.full_graph import route_after_self_check
+        assert (
+            route_after_self_check(
+                {
+                    "_self_check_pass": False,
+                    "_reflection_rounds_post": 3,
+                    "budget": {"max_reflection_rounds_post": 2},
+                }
+            )
+            == "format_repair"
+        )
+
+
+# -----------------------------------------------------------------------
+# Node 单元测试
+# -----------------------------------------------------------------------
+
+class TestFormatRepairNode:
+    """FormatRepair 不依赖 LLM，直接测。"""
+
+    def test_fixes_markdown_and_citations(self):
+        from nervos_brain.graph_engine.full_nodes import format_repair
+        state = {
+            "request_id": "r1",
+            "_final_response": {
+                "request_id": "r1",
+                "text": "答案 [1] 代码块\n```python\nprint('hello')",
+                "citations": [
+                    {"label": "[1]", "url": "https://a.com", "anchor": "s1", "title": "Doc A"},
+                ],
+            },
+        }
+        result = format_repair(state)
+        resp = result["_final_response"]
+        assert "```" in resp["text"]
+        assert len(resp["citations"]) == 1
+        assert "## 参考来源" in resp["text"]
+        assert "https://a.com" in resp["text"]
+
+    def test_format_repair_does_not_duplicate_existing_reference_section(self):
+        from nervos_brain.graph_engine.full_nodes import format_repair
+        state = {
+            "request_id": "r-ref-section",
+            "_final_response": {
+                "request_id": "r-ref-section",
+                "text": "答案 [1]\n\n## 参考来源\n\n[1] Existing\nhttps://a.com",
+                "citations": [
+                    {"label": "[1]", "url": "https://a.com", "anchor": "s1", "title": "Doc A"},
+                ],
+            },
+        }
+        result = format_repair(state)
+        text = result["_final_response"]["text"]
+        assert text.count("## 参考来源") == 1
+
+    def test_builds_platform_outbound_message(self):
+        from nervos_brain.graph_engine.full_nodes import format_repair
+        state = {
+            "request_id": "r2",
+            "user_message": {
+                "content": "test",
+                "context": {"platform": "telegram", "user_id": "u2"},
+            },
+            "_final_response": {
+                "request_id": "r2",
+                "text": "Long text " + ("A" * 4200),
+                "citations": [],
+            },
+        }
+        result = format_repair(state)
+        outbound = result.get("_outbound_message", {})
+        assert outbound.get("context", {}).get("platform") == "telegram"
+        assert len(outbound.get("segments", [])) >= 2
+
+    def test_merges_tool_trace_summary(self):
+        from nervos_brain.graph_engine.full_nodes import format_repair
+        state = {
+            "request_id": "r3",
+            "_tool_execution_summary": "tools=s1:github_search=ok:1",
+            "_final_response": {
+                "request_id": "r3",
+                "text": "答案 [1]",
+                "citations": [
+                    {"label": "[1]", "url": "https://a.com", "anchor": "a1", "title": "Doc"},
+                ],
+            },
+        }
+        result = format_repair(state)
+        assert "github_search" in result["_final_response"]["trace_summary"]
+
+
+class TestEvidenceMergerNode:
+    """EvidenceMerger 不依赖 LLM，直接测。"""
+
+    def test_dedup_and_conflict(self):
+        from nervos_brain.graph_engine.full_nodes import evidence_merger
+        state = {
+            "evidence": [
+                {"id": "1", "hash": "aaa", "payload": {"source": "rfcs", "version": "0.2"}},
+                {"id": "2", "hash": "aaa", "payload": {"source": "rfcs", "version": "0.2"}},
+                {"id": "3", "hash": "bbb", "payload": {"source": "rfcs", "version": "0.3"}},
+            ]
+        }
+        result = evidence_merger(state)
+        assert len(result["evidence"]) == 2
+        assert len(result["conflicts"]) == 1
+        assert result["conflicts"][0]["reason"] == "version_mismatch"
+
+
+class TestRetrieverPlannerNode:
+    """RetrieverPlanner 归一化逻辑测试。"""
+
+    def test_supported_tool_is_preserved(self):
+        from nervos_brain.graph_engine.full_nodes import retriever_planner
+        state = _make_state(
+            user_message={"content": "什么是 ckb"},
+            info_needs=[{"kind": "concept_gap", "question": "定义", "required": False}],
+        )
+        mock_json_responses = {
+            "检索规划": {
+                "plan_id": "p1",
+                "rationale": "use github tool",
+                "steps": [
+                    {
+                        "step_id": "s1",
+                        "tool": "github_search",
+                        "query": "ckb definition",
+                        "filters": {},
+                        "top_k": 3,
+                    }
+                ],
+                "parallel_groups": [["s1"]],
+                "budget": {"max_tool_calls": 3},
+            }
+        }
+        with patch(
+            "nervos_brain.graph_engine.full_nodes.call_llm_json",
+            _mock_call_llm_json_factory(mock_json_responses),
+        ):
+            out = retriever_planner(state)
+
+        steps = out["retrieval_plan"]["steps"]
+        assert steps
+        assert steps[0]["tool"] == "github_search"
+
+    def test_unknown_tool_still_falls_back_to_qdrant_search(self):
+        from nervos_brain.graph_engine.full_nodes import retriever_planner
+        state = _make_state(
+            user_message={"content": "什么是 ckb"},
+            info_needs=[{"kind": "concept_gap", "question": "定义", "required": False}],
+        )
+        mock_json_responses = {
+            "检索规划": {
+                "plan_id": "p2",
+                "rationale": "unsupported tool",
+                "steps": [
+                    {
+                        "step_id": "s1",
+                        "tool": "web_search",
+                        "query": "ckb definition",
+                        "filters": {},
+                        "top_k": 3,
+                    }
+                ],
+                "parallel_groups": [["s1"]],
+                "budget": {"max_tool_calls": 3},
+            }
+        }
+        with patch(
+            "nervos_brain.graph_engine.full_nodes.call_llm_json",
+            _mock_call_llm_json_factory(mock_json_responses),
+        ):
+            out = retriever_planner(state)
+
+        assert out["retrieval_plan"]["steps"][0]["tool"] == "qdrant_search"
+
+
+class TestInfoGapAssessorNode:
+    """InfoGapAssessor 行为测试。"""
+
+    def test_answer_direct_without_force_keeps_no_retrieval_policy(self):
+        from nervos_brain.graph_engine.full_nodes import info_gap_assessor
+
+        state = _make_state(user_message={"content": "你是谁"})
+        mock_json_responses = {
+            "信息缺口评估": {
+                "decision": "answer_direct",
+                "retrieval_policy": "single",
+                "info_needs": [],
+                "reasoning": "simple identity question",
+            }
+        }
+        with patch(
+            "nervos_brain.graph_engine.full_nodes.call_llm_json",
+            _mock_call_llm_json_factory(mock_json_responses),
+        ):
+            out = info_gap_assessor(state)
+
+        assert out["_route_decision"] == "answer_direct"
+        assert out["retrieval_policy"] == "none"
+        assert out["budget"]["max_tool_calls"] == 0
+
+    def test_answer_direct_is_coerced_to_has_needs_when_force_retrieval(self):
+        from nervos_brain.graph_engine.full_nodes import info_gap_assessor
+        state = _make_state(
+            user_message={"content": "什么是 ckb"},
+            force_retrieval=True,
+        )
+        mock_json_responses = {
+            "信息缺口评估": {
+                "decision": "answer_direct",
+                "info_needs": [],
+                "reasoning": "simple question",
+            }
+        }
+        with patch(
+            "nervos_brain.graph_engine.full_nodes.call_llm_json",
+            _mock_call_llm_json_factory(mock_json_responses),
+        ):
+            out = info_gap_assessor(state)
+
+        assert out["_route_decision"] == "has_needs"
+        assert out["retrieval_policy"] == "single"
+        assert isinstance(out["info_needs"], list)
+        assert len(out["info_needs"]) >= 1
+
+    def test_has_needs_single_policy_applies_light_budget(self):
+        from nervos_brain.graph_engine.full_nodes import info_gap_assessor
+
+        state = _make_state(
+            user_message={"content": "什么是 ckb"},
+            budget={"max_tool_calls": 4, "max_hops": 3, "max_reflection_rounds_pre": 2},
+        )
+        mock_json_responses = {
+            "信息缺口评估": {
+                "decision": "has_needs",
+                "retrieval_policy": "single",
+                "info_needs": [
+                    {"kind": "concept_gap", "question": "CKB definition", "required": False}
+                ],
+            }
+        }
+        with patch(
+            "nervos_brain.graph_engine.full_nodes.call_llm_json",
+            _mock_call_llm_json_factory(mock_json_responses),
+        ):
+            out = info_gap_assessor(state)
+
+        assert out["retrieval_policy"] == "single"
+        assert out["budget"]["max_hops"] == 1
+        assert out["budget"]["max_tool_calls"] == 2
+        assert out["budget"]["max_reflection_rounds_pre"] == 1
+
+    def test_has_needs_deep_policy_keeps_deeper_budget(self):
+        from nervos_brain.graph_engine.full_nodes import info_gap_assessor
+
+        state = _make_state(user_message={"content": "Fiber open_channel 报错，日志如下..."})
+        mock_json_responses = {
+            "信息缺口评估": {
+                "decision": "has_needs",
+                "retrieval_policy": "deep",
+                "info_needs": [
+                    {"kind": "error_trace", "question": "排查 Fiber open_channel 报错", "required": False}
+                ],
+            }
+        }
+        with patch(
+            "nervos_brain.graph_engine.full_nodes.call_llm_json",
+            _mock_call_llm_json_factory(mock_json_responses),
+        ):
+            out = info_gap_assessor(state)
+
+        assert out["retrieval_policy"] == "deep"
+        assert out["budget"]["max_hops"] >= 3
+        assert out["budget"]["max_tool_calls"] >= 3
+
+    def test_info_gap_preserves_llm_semantic_required_flags(self):
+        from nervos_brain.graph_engine.full_nodes import info_gap_assessor
+
+        state = _make_state(user_message={"content": "我的 open_channel 报错了，怎么修？"})
+        mock_json_responses = {
+            "信息缺口评估": {
+                "decision": "ask_user",
+                "retrieval_policy": "none",
+                "info_needs": [
+                    {
+                        "kind": "error_trace",
+                        "question": "请贴完整报错日志、Fiber 版本和运行环境",
+                        "required": True,
+                    }
+                ],
+            }
+        }
+        with patch(
+            "nervos_brain.graph_engine.full_nodes.call_llm_json",
+            _mock_call_llm_json_factory(mock_json_responses),
+        ):
+            out = info_gap_assessor(state)
+
+        assert out["_route_decision"] == "ask_user"
+        assert out["retrieval_policy"] == "none"
+        assert out["info_needs"][0]["required"] is True
+
+
+class TestFullGraphDebugState:
+    """内部 debug 字段必须被 LangGraph state schema 保留。"""
+
+    def test_timing_and_llm_trace_survive_graph_invoke(self):
+        from nervos_brain.graph_engine.full_graph import build_full_graph
+
+        def mock_call_llm_json(system_prompt, user_prompt, *, model=None):
+            _ = user_prompt, model
+            if "模型档位路由器" in system_prompt:
+                return {"tier": "low", "reasoning": "simple", "confidence": 0.9}
+            if "信息缺口评估" in system_prompt:
+                return {
+                    "decision": "answer_direct",
+                    "retrieval_policy": "none",
+                    "info_needs": [],
+                    "reasoning": "low-risk direct answer",
+                }
+            return {"decision": "accept_answer", "uncertainty_score": 0.1}
+
+        def mock_call_llm(system_prompt, user_prompt, *, json_mode=False, model=None, temperature=0.3, max_tokens=2048, reasoning_effort=None, verbosity=None):
+            _ = system_prompt, user_prompt, json_mode, model, temperature, max_tokens, reasoning_effort, verbosity
+            return "我是 Nervos Brain。"
+
+        state = _make_state(
+            user_message={"content": "你是谁"},
+            _request_started_ts_ms=1,
+        )
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm", mock_call_llm), \
+             patch("nervos_brain.graph_engine.full_nodes.call_llm_json", mock_call_llm_json):
+            result = build_full_graph().invoke(state)
+
+        assert result.get("_request_started_ts_ms") == 1
+        assert result.get("_node_timings")
+        assert result["_node_timings"][0]["node"] == "info_gap_assessor"
+        assert result.get("_llm_trace")
+        assert result["_llm_trace"][0]["kind"] == "router_json"
+        assert result.get("_llm_usage_summary", {}).get("calls", 0) >= 2
+
+
+class TestPromptBoundaries:
+    """关键 prompt 约束测试，防止后续回归到过度检索。"""
+
+    def test_info_gap_prompt_contains_retrieval_boundaries(self):
+        from nervos_brain.graph_engine import prompts
+
+        assert "retrieval_policy" in prompts.INFO_GAP_SYSTEM
+        assert "什么时候直答" in prompts.INFO_GAP_SYSTEM
+        assert "不要为了显得谨慎而过度检索" in prompts.INFO_GAP_SYSTEM
+        assert "你只做内部路由判断" in prompts.INFO_GAP_SYSTEM
+        assert "info_needs 是给后续检索/回答节点看的内部任务列表" in prompts.INFO_GAP_SYSTEM
+        assert "required=true 是强约束" in prompts.INFO_GAP_SYSTEM
+        assert "公开可检索信息缺口" in prompts.INFO_GAP_SYSTEM
+        assert "只要能通过检索获得，就必须 required=false" in prompts.INFO_GAP_SYSTEM
+        assert "如果你把公开可检索目标标成 required=true" in prompts.INFO_GAP_SYSTEM
+        assert "具体项目、真实案例" in prompts.INFO_GAP_SYSTEM
+        assert "不要向用户确认“你是不是想了解/检索 X”" in prompts.INFO_GAP_SYSTEM
+        assert "这是授权你检索，不是让你追问确认" in prompts.INFO_GAP_SYSTEM
+        assert "不要再追问" in prompts.INFO_GAP_SYSTEM
+
+    def test_retriever_planner_prompt_prefers_minimal_search(self):
+        from nervos_brain.graph_engine import prompts
+
+        assert "默认只做 1 个高质量 query" in prompts.RETRIEVER_PLANNER_SYSTEM
+        assert "retrieval_policy=\"single\"" in prompts.RETRIEVER_PLANNER_SYSTEM
+        assert "{retrieval_policy}" in prompts.RETRIEVER_PLANNER_USER
+        assert "优先规划 discourse_query" in prompts.RETRIEVER_PLANNER_SYSTEM
+        assert "这类问题不要只走 qdrant_search" in prompts.RETRIEVER_PLANNER_SYSTEM
+        assert "不要写“请检索/需要检索/帮助用户理解”这种指令腔" in prompts.RETRIEVER_PLANNER_SYSTEM
+
+    def test_reflection_prompt_avoids_vague_extra_loops(self):
+        from nervos_brain.graph_engine import prompts
+
+        assert "不要因为泛泛的不确定性继续检索" in prompts.REFLECTION_SYSTEM
+        assert "direct answer 可以没有 citations" in prompts.REFLECTION_SYSTEM
+        assert "不要让 ask_user 节点把检索目标复述给用户" in prompts.REFLECTION_SYSTEM
+        assert "不要输出“为了准确回答，我先确认一下" in prompts.REFLECTION_SYSTEM
+        assert "大概示例/伪代码/骨架/不要再追问" in prompts.REFLECTION_SYSTEM
+        assert "公开可检索缺口" in prompts.REFLECTION_SYSTEM
+        assert "如果 info_needs 中 required=true 的内容看起来其实是公开资料检索目标" in prompts.REFLECTION_SYSTEM
+        assert "不要再确认意图" in prompts.REFLECTION_SYSTEM
+        assert "公开资料版本冲突" in prompts.REFLECTION_SYSTEM
+        assert "我是萌新/小白/你自己决定/按你推荐的来" in prompts.REFLECTION_SYSTEM
+        assert "默认 testnet" in prompts.REFLECTION_SYSTEM
+        assert "超过目标耗时" in prompts.REFLECTION_SYSTEM
+
+    def test_model_router_prompt_discourages_high_for_routine_reflection(self):
+        from nervos_brain.graph_engine import full_nodes
+
+        assert "reflection_pre 的常规任务通常选择 low 或 medium" in full_nodes._LLM_ROUTER_SYSTEM
+        assert "已超过目标耗时" in full_nodes._LLM_ROUTER_SYSTEM
+
+    def test_answer_composer_prompt_prioritizes_current_question_and_allows_examples(self):
+        from nervos_brain.graph_engine import prompts
+
+        assert "当前用户问题优先级最高" in prompts.ANSWER_COMPOSER_SYSTEM
+        assert "不要回答旧问题" in prompts.ANSWER_COMPOSER_SYSTEM
+        assert "教学性示例代码" in prompts.ANSWER_COMPOSER_SYSTEM
+        assert "占位函数或 TODO" in prompts.ANSWER_COMPOSER_SYSTEM
+        assert "每条包含名称、它是什么、为什么相关、链接/引用" in prompts.ANSWER_COMPOSER_SYSTEM
+        assert "Talk/forum" in prompts.ANSWER_COMPOSER_SYSTEM
+
+    def test_direct_answer_prompt_defers_project_and_source_requests_to_retrieval(self):
+        from nervos_brain.graph_engine import prompts
+
+        assert "不追加参考来源" in prompts.DIRECT_ANSWER_SYSTEM
+        assert "直观类比或假想例子" in prompts.DIRECT_ANSWER_SYSTEM
+        assert "真实项目、链接、来源" in prompts.DIRECT_ANSWER_SYSTEM
+        assert "不要把内部流程说给用户听" in prompts.DIRECT_ANSWER_SYSTEM
+        assert "直接给有用的骨架" in prompts.DIRECT_ANSWER_SYSTEM
+
+
+class TestProviderRegistry:
+    """ProviderCapabilityRegistry 测试。"""
+
+    def test_get_model_for_planning(self):
+        from nervos_brain.graph_engine.provider_registry import ProviderCapabilityRegistry
+        reg = ProviderCapabilityRegistry()
+        model = reg.get_model_for("planning", max_cost="low")
+        assert model == "gpt-4o-mini"
+
+    def test_get_model_for_composing(self):
+        from nervos_brain.graph_engine.provider_registry import ProviderCapabilityRegistry
+        reg = ProviderCapabilityRegistry()
+        model = reg.get_model_for("composing")
+        assert model in ("gpt-4o", "claude-3-5-sonnet-20241022")
+
+    def test_get_profile_for_uses_default_router_tiers(self):
+        from nervos_brain.graph_engine.provider_registry import ProviderCapabilityRegistry
+        reg = ProviderCapabilityRegistry()
+
+        router = reg.get_profile_for("general", tier="router", require_json=True)
+        low = reg.get_profile_for("planning", tier="low", require_json=True)
+        medium = reg.get_profile_for("reflection", tier="medium", require_json=True)
+        high = reg.get_profile_for("composing", tier="high")
+
+        assert router["model"] == "openai/gpt-5.4-mini"
+        assert router["reasoning_effort"] == "low"
+        assert low["model"] == "openai/gpt-5.4-mini"
+        assert medium["model"] == "openai/gpt-5.5"
+        assert medium["reasoning_effort"] == "low"
+        assert high["model"] == "openai/gpt-5.5"
+        assert high["reasoning_effort"] == "high"
+
+
+class TestRuntimeInjection:
+    """验证 runtime 注入依赖在图执行中可用。"""
+
+    def test_invoke_full_graph_uses_injected_multi_retriever(self):
+        from nervos_brain.graph_engine.full_graph import (
+            FullGraphRuntime,
+            build_full_graph,
+            invoke_full_graph,
+        )
+
+        class FakeRetriever:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def search(self, query: str, filters=None, top_k: int = 5):
+                _ = query, filters, top_k
+                self.calls += 1
+                return [
+                    {
+                        "id": "ev-1",
+                        "source": "qdrant",
+                        "title": "CKB intro",
+                        "url": "https://example.com/ckb",
+                        "anchor": "doc:1",
+                        "snippet": "CKB is the layer-1 of Nervos.",
+                        "score": 0.9,
+                        "payload": {"source": "github_docs", "version": "v1"},
+                        "hash": "h1",
+                        "retrieved_ts_ms": 1,
+                    }
+                ]
+
+        retriever = FakeRetriever()
+        runtime = FullGraphRuntime(multi_retriever=retriever)
+        state = _make_state(user_message={"content": "什么是 ckb"}, force_retrieval=True)
+
+        mock_llm_responses = {
+            "回答组装": "CKB 是 Nervos 的一层网络 [1]。",
+        }
+        mock_json_responses = {
+            "信息缺口评估": {
+                "decision": "has_needs",
+                "info_needs": [{"kind": "concept_gap", "question": "定义", "required": False}],
+            },
+            "检索规划": {
+                "plan_id": "p1",
+                "rationale": "retrieve",
+                "steps": [{"step_id": "s1", "tool": "qdrant_search", "query": "什么是 ckb", "filters": {}, "top_k": 3}],
+                "parallel_groups": [["s1"]],
+                "budget": {"max_tool_calls": 1},
+            },
+            "证据评分": {"grade": "enough", "reasoning": "enough"},
+            "自检": {"pass": True, "issues": [], "reasoning": "ok"},
+        }
+
+        with patch(
+            "nervos_brain.graph_engine.full_nodes.call_llm",
+            _mock_call_llm_factory(mock_llm_responses),
+        ), patch(
+            "nervos_brain.graph_engine.full_nodes.call_llm_json",
+            _mock_call_llm_json_factory(mock_json_responses),
+        ):
+            graph = build_full_graph()
+            out = invoke_full_graph(state, runtime=runtime, compiled_graph=graph)
+
+        assert retriever.calls >= 1
+        assert len(out.get("evidence", [])) >= 1
+        assert out.get("_final_response", {}).get("text")
+
+
+class TestNodeModelRouter:
+    """节点级模型 router 测试。"""
+
+    def test_answer_composer_uses_router_selected_high_profile(self):
+        from nervos_brain.graph_engine.full_nodes import answer_composer
+        from nervos_brain.graph_engine.provider_registry import ModelProfile, ProviderCapabilityRegistry
+
+        registry = ProviderCapabilityRegistry(
+            profiles={
+                "router": ModelProfile("router", "openai/gpt-5.4-mini", "low", "low", 512),
+                "low": ModelProfile("low", "openai/gpt-5.4-mini", "low", "low", 2048),
+                "medium": ModelProfile("medium", "openai/gpt-5.5", "low", "low", 2048),
+                "high": ModelProfile("high", "openai/gpt-5.5", "high", "low", 4096),
+            }
+        )
+        calls: list[dict] = []
+
+        def mock_call_llm_json(system_prompt, user_prompt, *, model=None, reasoning_effort=None, verbosity=None, max_tokens=None):
+            calls.append(
+                {
+                    "kind": "router",
+                    "model": model,
+                    "reasoning_effort": reasoning_effort,
+                    "verbosity": verbosity,
+                    "max_tokens": max_tokens,
+                }
+            )
+            assert "模型档位路由器" in system_prompt
+            return {"tier": "high", "reasoning": "complex code answer", "confidence": 0.9}
+
+        def mock_call_llm(system_prompt, user_prompt, *, json_mode=False, model=None, temperature=0.3, max_tokens=2048, reasoning_effort=None, verbosity=None, disable_response_storage=None):
+            _ = system_prompt, user_prompt, json_mode, temperature, disable_response_storage
+            calls.append(
+                {
+                    "kind": "business",
+                    "model": model,
+                    "reasoning_effort": reasoning_effort,
+                    "verbosity": verbosity,
+                    "max_tokens": max_tokens,
+                }
+            )
+            return "这里是完整 TypeScript 代码 [1]。"
+
+        state = _make_state(
+            user_message={"content": "写完整 TS 交易调用代码"},
+            evidence=[
+                {
+                    "id": "ev-1",
+                    "source": "github",
+                    "title": "CCC transfer",
+                    "url": "https://example.com/ccc",
+                    "anchor": "a1",
+                    "snippet": "send transaction",
+                    "score": 0.9,
+                    "payload": {},
+                    "hash": "h1",
+                    "retrieved_ts_ms": 1,
+                }
+            ],
+            _provider_registry=registry,
+        )
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm_json", mock_call_llm_json), \
+             patch("nervos_brain.graph_engine.full_nodes.call_llm", mock_call_llm):
+            out = answer_composer(state)
+
+        assert out["_final_response"]["text"]
+        assert calls[0] == {
+            "kind": "router",
+            "model": "openai/gpt-5.4-mini",
+            "reasoning_effort": "low",
+            "verbosity": "low",
+            "max_tokens": 512,
+        }
+        assert calls[1] == {
+            "kind": "business",
+            "model": "openai/gpt-5.5",
+            "reasoning_effort": "high",
+            "verbosity": "low",
+            "max_tokens": 4096,
+        }
+
+    def test_router_failure_falls_back_without_breaking_direct_answer(self):
+        from nervos_brain.graph_engine.full_nodes import answer_composer
+        from nervos_brain.graph_engine.provider_registry import ModelProfile, ProviderCapabilityRegistry
+
+        registry = ProviderCapabilityRegistry(
+            profiles={
+                "router": ModelProfile("router", "openai/gpt-5.4-mini", "low", "low", 512),
+                "low": ModelProfile("low", "openai/gpt-5.4-mini", "low", "low", 2048),
+                "medium": ModelProfile("medium", "openai/gpt-5.5", "low", "low", 2048),
+                "high": ModelProfile("high", "openai/gpt-5.5", "high", "low", 4096),
+            }
+        )
+        business_calls: list[dict] = []
+
+        def mock_call_llm_json(*args, **kwargs):
+            _ = args, kwargs
+            raise RuntimeError("router down")
+
+        def mock_call_llm(system_prompt, user_prompt, *, json_mode=False, model=None, temperature=0.3, max_tokens=2048, reasoning_effort=None, verbosity=None, disable_response_storage=None):
+            _ = system_prompt, user_prompt, json_mode, temperature, disable_response_storage
+            business_calls.append(
+                {
+                    "model": model,
+                    "reasoning_effort": reasoning_effort,
+                    "verbosity": verbosity,
+                    "max_tokens": max_tokens,
+                }
+            )
+            return "我是 Nervos Brain。"
+
+        state = _make_state(
+            user_message={"content": "你是谁"},
+            retrieval_policy="none",
+            _route_decision="answer_direct",
+            _provider_registry=registry,
+        )
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm_json", mock_call_llm_json), \
+             patch("nervos_brain.graph_engine.full_nodes.call_llm", mock_call_llm):
+            out = answer_composer(state)
+
+        assert out["_final_response"]["text"] == "我是 Nervos Brain。"
+        assert business_calls == [
+            {
+                "model": "openai/gpt-5.4-mini",
+                "reasoning_effort": "low",
+                "verbosity": "low",
+                "max_tokens": 2048,
+            }
+        ]

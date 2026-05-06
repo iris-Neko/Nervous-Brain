@@ -1,0 +1,1466 @@
+"""Telegram Bot polling runtime (token-based online receive/send layer).
+
+Scope:
+  - Telegram Bot API client (getMe/getUpdates/send*)
+  - Update offset persistence
+  - Online pipeline:
+      Telegram update -> MessageEnvelope -> GraphState -> Outbound -> send requests
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable
+
+import requests
+
+from nervos_brain.logging_system import log_request_context
+from nervos_brain.response_normalizer.platform_formatter import format_response_to_outbound
+
+from .telegram_bot_protocol_adapter import (
+    message_envelope_to_graph_state,
+    outbound_message_to_telegram_requests,
+    telegram_update_to_message_envelope,
+)
+from .feedback import FeedbackJsonlStore, parse_csat_callback_data
+
+logger = logging.getLogger(__name__)
+
+
+class TelegramBotRuntimeError(RuntimeError):
+    """Domain error for token-based Telegram Bot runtime."""
+
+
+@dataclass(frozen=True)
+class TelegramBotConfig:
+    """Config for Telegram Bot API calls."""
+
+    bot_token: str
+    api_base: str = "https://api.telegram.org"
+
+    @classmethod
+    def from_env(cls) -> "TelegramBotConfig":
+        token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+        if not token:
+            raise TelegramBotRuntimeError("Missing TELEGRAM_BOT_TOKEN environment variable.")
+
+        api_base = (os.getenv("TELEGRAM_BOT_API_BASE") or "https://api.telegram.org").strip()
+        if not api_base:
+            api_base = "https://api.telegram.org"
+        return cls(bot_token=token, api_base=api_base.rstrip("/"))
+
+
+class TelegramBotAPI:
+    """Small sync client over Telegram Bot API."""
+
+    def __init__(
+        self,
+        config: TelegramBotConfig,
+        *,
+        session: requests.Session | None = None,
+    ) -> None:
+        self._cfg = config
+        self._session = session or requests.Session()
+
+    @property
+    def api_base(self) -> str:
+        return self._cfg.api_base
+
+    def _method_url(self, method: str) -> str:
+        return f"{self._cfg.api_base}/bot{self._cfg.bot_token}/{method}"
+
+    def call(
+        self,
+        method: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout_s: float = 30.0,
+    ) -> Any:
+        try:
+            resp = self._session.post(
+                self._method_url(method),
+                json=payload or {},
+                timeout=timeout_s,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+        except requests.RequestException as exc:
+            detail = _redact_telegram_error(str(exc), self._cfg.bot_token)
+            raise TelegramBotRuntimeError(
+                f"Telegram Bot API request failed for `{method}`: {detail}"
+            ) from exc
+        except ValueError as exc:
+            raise TelegramBotRuntimeError(
+                f"Telegram Bot API returned non-JSON response for `{method}`."
+            ) from exc
+
+        if not isinstance(body, dict):
+            raise TelegramBotRuntimeError(
+                f"Telegram Bot API malformed response for `{method}`: expected object."
+            )
+        if not bool(body.get("ok", False)):
+            description = str(body.get("description", "unknown error"))
+            raise TelegramBotRuntimeError(
+                f"Telegram Bot API `{method}` failed: {description}"
+            )
+        return body.get("result")
+
+    def get_me(self) -> dict[str, Any]:
+        result = self.call("getMe")
+        if isinstance(result, dict):
+            return result
+        raise TelegramBotRuntimeError("Telegram Bot API `getMe` returned invalid shape.")
+
+    def get_updates(
+        self,
+        *,
+        offset: int | None = None,
+        timeout_s: int = 25,
+        limit: int = 20,
+        allowed_updates: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        payload: dict[str, Any] = {
+            "timeout": max(0, int(timeout_s)),
+            "limit": max(1, min(int(limit), 100)),
+            "allowed_updates": allowed_updates
+            or ["message", "edited_message", "channel_post", "edited_channel_post", "callback_query"],
+        }
+        if offset is not None:
+            payload["offset"] = int(offset)
+
+        result = self.call(
+            "getUpdates",
+            payload=payload,
+            timeout_s=max(10.0, float(timeout_s) + 10.0),
+        )
+        if not isinstance(result, list):
+            raise TelegramBotRuntimeError(
+                "Telegram Bot API `getUpdates` returned invalid shape."
+            )
+        return [row for row in result if isinstance(row, dict)]
+
+    def send_request(
+        self,
+        *,
+        method: str,
+        payload: dict[str, Any],
+        timeout_s: float = 30.0,
+    ) -> Any:
+        return self.call(method=method, payload=payload, timeout_s=timeout_s)
+
+    def send_chat_action(
+        self,
+        *,
+        chat_id: str,
+        action: str = "typing",
+        timeout_s: float = 10.0,
+    ) -> Any:
+        return self.send_request(
+            method="sendChatAction",
+            payload={"chat_id": chat_id, "action": action},
+            timeout_s=timeout_s,
+        )
+
+    def send_requests(self, requests_payloads: list[dict[str, Any]]) -> int:
+        sent = 0
+        for req in requests_payloads:
+            method = str(req.get("method", "sendMessage"))
+            payload = req.get("payload")
+            if not isinstance(payload, dict):
+                raise TelegramBotRuntimeError("Invalid send request payload: expected object.")
+            self.send_request(method=method, payload=payload)
+            sent += 1
+        return sent
+
+
+@dataclass(frozen=True)
+class TelegramUpdateOffsetStore:
+    """File-backed checkpoint for Telegram `update_id + 1` offset."""
+
+    path: Path
+
+    def load(self) -> int | None:
+        if not self.path.exists():
+            return None
+        try:
+            raw = self.path.read_text(encoding="utf-8").strip()
+            if not raw:
+                return None
+            value = int(raw)
+            return value if value >= 0 else None
+        except Exception:
+            return None
+
+    def save(self, offset: int) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(str(int(offset)), encoding="utf-8")
+
+
+GraphRunner = Callable[[dict[str, Any]], dict[str, Any]]
+
+
+class _TelegramTypingProgress:
+    """Keep Telegram's built-in typing indicator alive while the graph runs."""
+
+    def __init__(
+        self,
+        *,
+        api: Any,
+        chat_id: str | None,
+        enabled: bool,
+        interval_s: float = 4.0,
+    ) -> None:
+        self._api = api
+        self._chat_id = str(chat_id or "").strip()
+        self._enabled = bool(enabled and self._chat_id)
+        self._interval_s = max(1.0, float(interval_s))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if not self._enabled:
+            return
+        self._send_once()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="telegram-typing-progress",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_s):
+            self._send_once()
+
+    def _send_once(self) -> None:
+        try:
+            if hasattr(self._api, "send_chat_action"):
+                self._api.send_chat_action(chat_id=self._chat_id, action="typing", timeout_s=10.0)
+            else:
+                self._api.send_request(
+                    method="sendChatAction",
+                    payload={"chat_id": self._chat_id, "action": "typing"},
+                    timeout_s=10.0,
+                )
+        except Exception as exc:
+            logger.debug("telegram typing indicator failed chat_id=%s error=%s", self._chat_id, exc)
+
+
+class TelegramPollingGateway:
+    """Token-based polling gateway that runs graph and sends replies."""
+
+    def __init__(
+        self,
+        *,
+        api: TelegramBotAPI,
+        graph_runner: GraphRunner,
+        offset_store: TelegramUpdateOffsetStore | None = None,
+        render_mode: str = "markdown",
+        append_csat: bool = False,
+        allowed_chat_ids: set[str] | None = None,
+        feedback_store: FeedbackJsonlStore | None = None,
+        debug_log_file: str | Path | None = None,
+        memory_service: Any | None = None,
+        memory_context_limit: int = 20,
+        mention_only_in_group: bool = True,
+        respond_to_bot_replies: bool = True,
+        bot_user_id: str | None = None,
+        bot_username: str | None = None,
+        target_elapsed_ms: int = 30000,
+        max_elapsed_ms: int = 90000,
+    ) -> None:
+        self._api = api
+        self._graph_runner = graph_runner
+        self._offset_store = offset_store
+        self._next_offset = offset_store.load() if offset_store else None
+        self._render_mode = "plain" if render_mode == "plain" else "markdown"
+        self._append_csat = append_csat
+        self._allowed_chat_ids = set(allowed_chat_ids or [])
+        self._feedback_store = feedback_store
+        debug_path = str(debug_log_file or "").strip()
+        self._debug_log_file = Path(debug_path).expanduser() if debug_path else None
+        self._memory_service = memory_service
+        self._memory_context_limit = max(1, min(int(memory_context_limit or 20), 100))
+        self._mention_only_in_group = bool(mention_only_in_group)
+        self._respond_to_bot_replies = bool(respond_to_bot_replies)
+        self._bot_user_id = str(bot_user_id or "").strip()
+        self._bot_username = str(bot_username or "").lstrip("@").strip()
+        self._target_elapsed_ms = max(0, int(target_elapsed_ms or 0))
+        self._max_elapsed_ms = max(0, int(max_elapsed_ms or 0))
+
+    @property
+    def next_offset(self) -> int | None:
+        return self._next_offset
+
+    def set_next_offset(self, offset: int) -> None:
+        self._next_offset = max(0, int(offset))
+        if self._offset_store:
+            self._offset_store.save(self._next_offset)
+
+    def poll_once(
+        self,
+        *,
+        timeout_s: int = 25,
+        limit: int = 20,
+        dry_run: bool = False,
+    ) -> list[dict[str, Any]]:
+        updates = self._api.get_updates(
+            offset=self._next_offset,
+            timeout_s=timeout_s,
+            limit=limit,
+        )
+        if not updates:
+            logger.debug("telegram poll_once: no updates")
+            return []
+
+        rows: list[dict[str, Any]] = []
+        max_seen: int | None = None
+        for update in updates:
+            uid = _extract_update_id(update)
+            if uid is not None:
+                max_seen = uid if max_seen is None else max(max_seen, uid)
+            rows.append(self.process_update(update, dry_run=dry_run))
+
+        if max_seen is not None:
+            self._next_offset = max_seen + 1
+            if self._offset_store:
+                self._offset_store.save(self._next_offset)
+        logger.debug("telegram poll_once: updates=%d next_offset=%s", len(rows), self._next_offset)
+        return rows
+
+    def process_update(
+        self,
+        update: dict[str, Any],
+        *,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        update_id = _extract_update_id(update)
+        raw_chat_id = _extract_chat_id_from_update(update)
+        callback = _extract_callback_query(update)
+        if isinstance(callback, dict):
+            return self._process_callback_query(
+                update_id=update_id,
+                callback=callback,
+                raw_chat_id=raw_chat_id,
+                dry_run=dry_run,
+            )
+
+        msg = _extract_message_payload(update)
+        if isinstance(msg, dict):
+            sender = msg.get("from")
+            if isinstance(sender, dict) and bool(sender.get("is_bot")):
+                return {
+                    "update_id": update_id,
+                    "chat_id": raw_chat_id,
+                    "ignored": True,
+                    "reason": "bot_sender",
+                    "request_id": None,
+                    "sent_count": 0,
+                }
+
+        try:
+            envelope = telegram_update_to_message_envelope(update)
+        except ValueError:
+            return {
+                "update_id": update_id,
+                "chat_id": raw_chat_id,
+                "ignored": True,
+                "reason": "unsupported_update",
+                "request_id": None,
+                "sent_count": 0,
+            }
+
+        chat_id = (
+            str(envelope.get("context", {}).get("channel_id") or "")
+            or str(envelope.get("context", {}).get("guild_id") or "")
+        )
+        if self._allowed_chat_ids and chat_id not in self._allowed_chat_ids:
+            return {
+                "update_id": update_id,
+                "chat_id": chat_id or raw_chat_id,
+                "ignored": True,
+                "reason": "chat_not_allowed",
+                "request_id": None,
+                "sent_count": 0,
+            }
+
+        if _is_feedback_command(envelope):
+            return self._process_feedback_command(
+                update_id=update_id,
+                envelope=envelope,
+                chat_id=chat_id or raw_chat_id,
+                dry_run=dry_run,
+            )
+
+        if not self._should_process_message(update=update, envelope=envelope):
+            logger.debug(
+                "telegram ignored not mentioned update_id=%s chat_id=%s",
+                update_id,
+                chat_id or raw_chat_id,
+            )
+            return {
+                "update_id": update_id,
+                "chat_id": chat_id or raw_chat_id,
+                "ignored": True,
+                "reason": "not_mentioned",
+                "request_id": None,
+                "sent_count": 0,
+            }
+
+        state = message_envelope_to_graph_state(envelope)
+        request_started_ts_ms = int(time.time() * 1000)
+        graph_start = time.perf_counter()
+        state["_request_started_ts_ms"] = request_started_ts_ms
+        budget = state.setdefault("budget", {})
+        if not isinstance(budget, dict):
+            budget = {}
+            state["budget"] = budget
+        if self._target_elapsed_ms > 0:
+            budget.setdefault("target_elapsed_ms", self._target_elapsed_ms)
+        if self._max_elapsed_ms > 0:
+            budget.setdefault("max_elapsed_ms", self._max_elapsed_ms)
+        state["render_mode"] = self._render_mode
+        state["append_csat"] = self._append_csat
+        self._attach_recent_memory_context(state=state, envelope=envelope)
+        self._write_memory_event(envelope=envelope, role="user", content=str(envelope.get("content", "") or ""))
+        request_id = str(state.get("request_id", "unknown"))
+
+        with log_request_context(request_id):
+            progress = _TelegramTypingProgress(
+                api=self._api,
+                chat_id=chat_id or raw_chat_id,
+                enabled=not dry_run,
+            )
+            progress.start()
+            try:
+                result = self._graph_runner(state)
+            except Exception:
+                logger.exception(
+                    "telegram graph_runner failed chat_id=%s update_id=%s",
+                    chat_id or raw_chat_id,
+                    update_id,
+                )
+                result = {
+                    "_final_response": {
+                        "request_id": str(state.get("request_id", "unknown")),
+                        "text": "处理请求时发生错误，请稍后重试。",
+                        "citations": [],
+                    }
+                }
+            finally:
+                progress.stop()
+        graph_elapsed_ms = int((time.perf_counter() - graph_start) * 1000)
+        result["_graph_elapsed_ms"] = graph_elapsed_ms
+        result["_request_started_ts_ms"] = request_started_ts_ms
+
+        outbound = _build_outbound_from_graph_result(
+            result=result,
+            state=state,
+            envelope=envelope,
+            render_mode=self._render_mode,
+            append_csat=self._append_csat,
+        )
+        self._write_memory_event(
+            envelope=envelope,
+            role="assistant",
+            content=_outbound_text_preview(outbound, limit=4000),
+        )
+        send_reqs = outbound_message_to_telegram_requests(outbound)
+        sent_count = 0
+        if not dry_run:
+            sent_count = self._api.send_requests(send_reqs)
+            if self._feedback_store is not None:
+                self._feedback_store.append_answer(
+                    _build_answer_feedback_record(
+                        result=result,
+                        state=state,
+                        envelope=envelope,
+                        outbound=outbound,
+                        sent_count=sent_count,
+                        has_csat=bool(self._append_csat and send_reqs),
+                    )
+                )
+        self._write_debug_event(
+            update=update,
+            update_id=update_id,
+            chat_id=chat_id or raw_chat_id,
+            envelope=envelope,
+            state=state,
+            result=result,
+            outbound=outbound,
+            send_reqs=send_reqs,
+            sent_count=sent_count if not dry_run else len(send_reqs),
+            dry_run=dry_run,
+        )
+        logger.info(
+            "telegram processed update_id=%s chat_id=%s request_id=%s sent=%d dry_run=%s",
+            update_id,
+            chat_id or raw_chat_id,
+            request_id,
+            sent_count if not dry_run else len(send_reqs),
+            bool(dry_run),
+        )
+
+        return {
+            "update_id": update_id,
+            "chat_id": chat_id or raw_chat_id,
+            "ignored": False,
+            "reason": "",
+            "request_id": state.get("request_id"),
+            "sent_count": sent_count if not dry_run else len(send_reqs),
+        }
+
+    def _attach_recent_memory_context(
+        self,
+        *,
+        state: dict[str, Any],
+        envelope: dict[str, Any],
+    ) -> None:
+        svc = self._memory_service
+        if svc is None or not hasattr(svc, "list_recent_message_events"):
+            return
+        context = envelope.get("context", {})
+        if not isinstance(context, dict):
+            return
+        platform = str(context.get("platform", "telegram") or "telegram")
+        user_id = str(context.get("user_id", "") or "")
+        if not user_id:
+            return
+        if not _should_attach_recent_context(envelope):
+            state["recent_messages"] = []
+            state["conversation_context"] = ""
+            return
+        try:
+            rows = svc.list_recent_message_events(
+                platform=platform,
+                user_id=user_id,
+                guild_id=_optional_str(context.get("guild_id")),
+                channel_id=_optional_str(context.get("channel_id")),
+                thread_id=_optional_str(context.get("thread_id")),
+                limit=self._memory_context_limit,
+            )
+        except Exception as exc:
+            logger.debug("telegram recent memory read failed user_id=%s error=%s", user_id, exc)
+            return
+        if isinstance(rows, list):
+            state["recent_messages"] = rows
+            state["conversation_context"] = _format_recent_messages(rows)
+
+    def _write_memory_event(
+        self,
+        *,
+        envelope: dict[str, Any],
+        role: str,
+        content: str,
+    ) -> None:
+        svc = self._memory_service
+        text = str(content or "").strip()
+        if svc is None or not text:
+            return
+        context = envelope.get("context", {})
+        if not isinstance(context, dict):
+            return
+        user_id = str(context.get("user_id", "") or "")
+        if not user_id:
+            return
+        try:
+            svc.write_message_event(
+                platform=str(context.get("platform", "telegram") or "telegram"),
+                user_id=user_id,
+                guild_id=_optional_str(context.get("guild_id")),
+                channel_id=_optional_str(context.get("channel_id")),
+                thread_id=_optional_str(context.get("thread_id")),
+                role=role,
+                content=text,
+                created_ts_ms=_memory_event_ts_ms(envelope=envelope, role=role),
+            )
+        except Exception as exc:
+            logger.debug(
+                "telegram memory write failed role=%s user_id=%s error=%s",
+                role,
+                user_id,
+                exc,
+            )
+
+    def _process_callback_query(
+        self,
+        *,
+        update_id: int | None,
+        callback: dict[str, Any],
+        raw_chat_id: str | None,
+        dry_run: bool,
+    ) -> dict[str, Any]:
+        callback_id = str(callback.get("id", ""))
+        msg = callback.get("message")
+        chat_id = _extract_chat_id_from_message(msg) if isinstance(msg, dict) else raw_chat_id
+        if self._allowed_chat_ids and chat_id not in self._allowed_chat_ids:
+            return {
+                "update_id": update_id,
+                "chat_id": chat_id,
+                "ignored": True,
+                "reason": "chat_not_allowed",
+                "request_id": None,
+                "sent_count": 0,
+            }
+
+        data = str(callback.get("data", ""))
+        try:
+            parsed = parse_csat_callback_data(data)
+        except ValueError:
+            if not dry_run and callback_id:
+                self._api.send_request(
+                    method="answerCallbackQuery",
+                    payload={"callback_query_id": callback_id, "text": "Invalid rating."},
+                )
+            return {
+                "update_id": update_id,
+                "chat_id": chat_id,
+                "ignored": True,
+                "reason": "invalid_callback",
+                "request_id": None,
+                "sent_count": 0,
+            }
+
+        sender = callback.get("from")
+        if not isinstance(sender, dict):
+            sender = {}
+        context = _feedback_context_from_callback(callback)
+        answer_meta = (
+            self._feedback_store.latest_answer(parsed.request_id)
+            if self._feedback_store is not None
+            else None
+        )
+        answer_fields = _feedback_fields_from_answer(answer_meta)
+        preview = answer_fields.get("final_text_preview") or _message_text_preview(msg)
+        record = {
+            "request_id": parsed.request_id,
+            "platform": "telegram",
+            "chat_id": chat_id or "",
+            "user_id": str(sender.get("id", "")),
+            "score": parsed.score,
+            "comment": "",
+            "created_ts_ms": int(time.time() * 1000),
+            **answer_fields,
+            "final_text_preview": preview,
+            **context,
+        }
+        if self._feedback_store is not None and not dry_run:
+            record = self._feedback_store.append(record)
+
+        if not dry_run and callback_id:
+            duplicate = bool(record.get("is_duplicate_rating", False))
+            self._api.send_request(
+                method="answerCallbackQuery",
+                payload={
+                    "callback_query_id": callback_id,
+                    "text": "Rating already recorded."
+                    if duplicate
+                    else f"Thanks. Rating recorded: {parsed.score}/5",
+                    "show_alert": False,
+                },
+            )
+
+        logger.info(
+            "telegram csat update_id=%s chat_id=%s request_id=%s score=%s bad_case=%s dry_run=%s",
+            update_id,
+            chat_id,
+            parsed.request_id,
+            parsed.score,
+            bool(record.get("is_bad_case", parsed.score <= 3)),
+            bool(dry_run),
+        )
+        return {
+            "update_id": update_id,
+            "chat_id": chat_id,
+            "ignored": False,
+            "reason": "csat",
+            "request_id": parsed.request_id,
+            "sent_count": 0,
+            "score": parsed.score,
+            "is_bad_case": bool(record.get("is_bad_case", parsed.score <= 3)),
+            "is_duplicate_rating": bool(record.get("is_duplicate_rating", False)),
+        }
+
+    def _process_feedback_command(
+        self,
+        *,
+        update_id: int | None,
+        envelope: dict[str, Any],
+        chat_id: str | None,
+        dry_run: bool,
+    ) -> dict[str, Any]:
+        args = str(envelope.get("command_args", "") or "").strip()
+        request_id, comment = _parse_feedback_args(args)
+        sender_context = envelope.get("context", {})
+        if not isinstance(sender_context, dict):
+            sender_context = {}
+
+        if not request_id or not comment:
+            text = "用法: /feedback <request_id> <comment>"
+            if not dry_run:
+                self._api.send_requests(
+                    [_send_text_request(chat_id=chat_id, text=text, envelope=envelope)]
+                )
+            return {
+                "update_id": update_id,
+                "chat_id": chat_id,
+                "ignored": True,
+                "reason": "invalid_feedback_command",
+                "request_id": request_id,
+                "sent_count": 0 if dry_run else 1,
+            }
+
+        answer_meta = (
+            self._feedback_store.latest_answer(request_id)
+            if self._feedback_store is not None
+            else None
+        )
+        record = {
+            "request_id": request_id,
+            "platform": "telegram",
+            "chat_id": chat_id or "",
+            "user_id": str(sender_context.get("user_id", "")),
+            "comment": comment,
+            "created_ts_ms": int(time.time() * 1000),
+            **_context_ids(sender_context),
+            **_feedback_fields_from_answer(answer_meta),
+        }
+        if self._feedback_store is not None and not dry_run:
+            self._feedback_store.append_comment(record)
+
+        text = f"Feedback recorded for {request_id}."
+        if not dry_run:
+            self._api.send_requests(
+                [_send_text_request(chat_id=chat_id, text=text, envelope=envelope)]
+            )
+        return {
+            "update_id": update_id,
+            "chat_id": chat_id,
+            "ignored": False,
+            "reason": "feedback",
+            "request_id": request_id,
+            "sent_count": 0 if dry_run else 1,
+        }
+
+    def _write_debug_event(
+        self,
+        *,
+        update: dict[str, Any],
+        update_id: int | None,
+        chat_id: str | None,
+        envelope: dict[str, Any],
+        state: dict[str, Any],
+        result: dict[str, Any],
+        outbound: dict[str, Any],
+        send_reqs: list[dict[str, Any]],
+        sent_count: int,
+        dry_run: bool,
+    ) -> None:
+        path = self._debug_log_file
+        if path is None:
+            return
+        try:
+            response = result.get("_final_response")
+            if not isinstance(response, dict):
+                response = {}
+            context = envelope.get("context", {})
+            if not isinstance(context, dict):
+                context = {}
+            event = {
+                "created_ts_ms": int(time.time() * 1000),
+                "update_id": update_id,
+                "chat_id": str(chat_id or ""),
+                "request_id": str(state.get("request_id") or response.get("request_id") or ""),
+                "user_id": str(context.get("user_id", "")),
+                "message_id": str(envelope.get("message_id", "")),
+                "incoming_reply_to_message_id": str(envelope.get("reply_to_message_id", "")),
+                "outbound_reply_to_message_id": str(outbound.get("reply_to_message_id", "")),
+                "first_send_reply_to_message_id": _first_send_reply_to_message_id(send_reqs),
+                "content_preview": _message_text_preview(_extract_message_payload(update), limit=240),
+                "normalized_content": str(envelope.get("content", ""))[:240],
+                "route_decision": str(result.get("_route_decision") or state.get("_route_decision") or ""),
+                "retrieval_policy": str(result.get("retrieval_policy") or state.get("retrieval_policy") or ""),
+                "reflection_decision": str(result.get("reflection_decision") or state.get("reflection_decision") or ""),
+                "reflection_reasoning": str(result.get("reflection_reasoning") or state.get("reflection_reasoning") or "")[:500],
+                "info_needs": _debug_info_needs(result.get("info_needs") or state.get("info_needs")),
+                "tool_summary": str(result.get("_tool_execution_summary") or state.get("_tool_execution_summary") or ""),
+                "tool_calls": _infer_tool_calls(result=result, state=state),
+                "evidence_count": _infer_evidence_count(result=result, state=state, response=response),
+                "citation_count": len(response.get("citations", [])) if isinstance(response.get("citations"), list) else 0,
+                "graph_elapsed_ms": _int_like(result.get("_graph_elapsed_ms", 0)),
+                "node_timings": _debug_node_timings(result.get("_node_timings") or state.get("_node_timings")),
+                "llm_usage_summary": _debug_llm_usage_summary(result.get("_llm_usage_summary") or state.get("_llm_usage_summary")),
+                "llm_trace": _debug_llm_trace(result.get("_llm_trace") or state.get("_llm_trace")),
+                "time_budget": _debug_time_budget(result=result, state=state),
+                "final_text_preview": _outbound_text_preview(outbound, limit=600),
+                "sent_count": int(sent_count),
+                "dry_run": bool(dry_run),
+                "terminal_insufficient_evidence": bool(result.get("_terminal_insufficient_evidence") or state.get("_terminal_insufficient_evidence")),
+                "direct_answer": bool(result.get("_direct_answer") or state.get("_direct_answer")),
+                "ask_user_guard_reason": str(
+                    result.get("_ask_user_guard_reason")
+                    or response.get("ask_user_guard_reason")
+                    or state.get("_ask_user_guard_reason")
+                    or ""
+                ),
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        except Exception as exc:
+            logger.debug("telegram debug event write failed: %s", exc)
+
+
+    def _should_process_message(
+        self,
+        *,
+        update: dict[str, Any],
+        envelope: dict[str, Any],
+    ) -> bool:
+        msg = _extract_message_payload(update)
+        if not isinstance(msg, dict):
+            return False
+        if not _is_group_chat(msg):
+            return True
+        if not self._mention_only_in_group:
+            return True
+        if _is_bot_command_for_this_bot(
+            msg,
+            envelope=envelope,
+            bot_username=self._bot_username,
+        ):
+            return True
+        if _has_bot_mention(msg, bot_username=self._bot_username):
+            return True
+        if self._respond_to_bot_replies and _is_reply_to_this_bot(
+            msg,
+            bot_user_id=self._bot_user_id,
+            bot_username=self._bot_username,
+        ):
+            return True
+        return False
+
+
+def _extract_update_id(update: dict[str, Any]) -> int | None:
+    raw = update.get("update_id")
+    if isinstance(raw, int):
+        return raw
+    return None
+
+
+def _redact_telegram_error(text: str, bot_token: str) -> str:
+    redacted = str(text)
+    token = str(bot_token or "").strip()
+    if token:
+        redacted = redacted.replace(token, "<telegram-bot-token>")
+    redacted = re.sub(r"/bot[^/\s]+/", "/bot<telegram-bot-token>/", redacted)
+    return redacted
+
+
+def _extract_message_payload(update: dict[str, Any]) -> dict[str, Any] | None:
+    for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
+        value = update.get(key)
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _extract_callback_query(update: dict[str, Any]) -> dict[str, Any] | None:
+    value = update.get("callback_query")
+    return value if isinstance(value, dict) else None
+
+
+def _extract_chat_id_from_update(update: dict[str, Any]) -> str | None:
+    msg = _extract_message_payload(update)
+    if msg is None:
+        callback = _extract_callback_query(update)
+        if isinstance(callback, dict) and isinstance(callback.get("message"), dict):
+            msg = callback["message"]
+    if not isinstance(msg, dict):
+        return None
+    return _extract_chat_id_from_message(msg)
+
+
+def _extract_chat_id_from_message(msg: dict[str, Any]) -> str | None:
+    chat = msg.get("chat")
+    if not isinstance(chat, dict):
+        return None
+    value = chat.get("id")
+    if value is None:
+        return None
+    return str(value)
+
+
+def _message_text_preview(msg: Any, limit: int = 300) -> str:
+    if not isinstance(msg, dict):
+        return ""
+    text = msg.get("text")
+    if not isinstance(text, str):
+        text = str(msg.get("caption", "") or "")
+    return text[:limit]
+
+
+def _message_text(msg: dict[str, Any]) -> str:
+    text = msg.get("text")
+    if isinstance(text, str):
+        return text
+    caption = msg.get("caption")
+    if isinstance(caption, str):
+        return caption
+    return ""
+
+
+def _is_group_chat(msg: dict[str, Any]) -> bool:
+    chat = msg.get("chat")
+    if not isinstance(chat, dict):
+        return False
+    return str(chat.get("type", "")).lower() in {"group", "supergroup", "channel"}
+
+
+def _raw_command_target(text: str) -> tuple[str, str | None] | None:
+    match = re.match(r"^/([A-Za-z0-9_]+)(?:@([A-Za-z0-9_]+))?(?:\s|$)", str(text or "").strip())
+    if not match:
+        return None
+    return "/" + match.group(1).lower(), match.group(2)
+
+
+def _is_bot_command_for_this_bot(
+    msg: dict[str, Any],
+    *,
+    envelope: dict[str, Any],
+    bot_username: str,
+) -> bool:
+    command = str(envelope.get("command", "") or "").split("@", 1)[0].lower()
+    known_commands = {"/ask", "/help", "/start", "/feedback"}
+    if command not in known_commands:
+        return False
+    raw = _raw_command_target(_message_text(msg))
+    if raw is None:
+        return True
+    _raw_command, target = raw
+    if not target:
+        return True
+    if not bot_username:
+        return True
+    return target.lower() == bot_username.lower()
+
+
+def _has_bot_mention(msg: dict[str, Any], *, bot_username: str) -> bool:
+    text = _message_text(msg)
+    if not text:
+        return False
+    if bot_username:
+        return re.search(rf"@{re.escape(bot_username)}\b", text, flags=re.IGNORECASE) is not None
+    return re.search(r"@\w+_Bot\b", text, flags=re.IGNORECASE) is not None
+
+
+def _is_reply_to_this_bot(
+    msg: dict[str, Any],
+    *,
+    bot_user_id: str,
+    bot_username: str,
+) -> bool:
+    reply = msg.get("reply_to_message")
+    if not isinstance(reply, dict):
+        return False
+    sender = reply.get("from")
+    if not isinstance(sender, dict):
+        return False
+    if bot_user_id and str(sender.get("id", "") or "") == bot_user_id:
+        return True
+    username = str(sender.get("username", "") or "").lstrip("@")
+    if bot_username and username.lower() == bot_username.lower():
+        return True
+    return False
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _format_recent_messages(rows: list[Any], limit_chars: int = 1800) -> str:
+    if not rows:
+        return ""
+    lines: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        role = str(row.get("role", "message") or "message")
+        content = re.sub(r"\s+", " ", str(row.get("content", "") or "")).strip()
+        if not content:
+            continue
+        if len(content) > 220:
+            content = content[:220].rstrip() + "..."
+        lines.append(f"{role}: {content}")
+    text = "\n".join(lines).strip()
+    if len(text) > limit_chars:
+        text = text[-limit_chars:].lstrip()
+    return text
+
+
+def _normalized_message_text(text: Any) -> str:
+    return re.sub(r"\s+", "", str(text or "").lower())
+
+
+def _asks_for_recent_context(text: str) -> bool:
+    normalized = _normalized_message_text(text)
+    if not normalized:
+        return False
+    markers = (
+        "上文",
+        "上下文",
+        "刚才",
+        "刚刚",
+        "之前",
+        "前面",
+        "上面",
+        "继续",
+        "接着",
+        "延续",
+        "它",
+        "这个",
+        "那个",
+        "那",
+        "同样",
+        "换成",
+        "再来",
+        "再写",
+        "我刚才",
+        "你刚才",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def _is_standalone_named_question(text: str) -> bool:
+    normalized = _normalized_message_text(text)
+    if not normalized:
+        return False
+    if any(marker in normalized for marker in ("上文", "上下文", "刚才", "之前", "继续", "接着")):
+        return False
+    subjects = (
+        "ckb",
+        "nervos",
+        "fiber",
+        "ccc",
+        "rgb++",
+        "spore",
+        "molecule",
+        "cell",
+        "utxo",
+        "commonknowledgebase",
+    )
+    intents = (
+        "是什么",
+        "什么是",
+        "怎么",
+        "如何",
+        "为什么",
+        "区别",
+        "原理",
+        "流程",
+        "构建",
+        "开发",
+        "教程",
+        "介绍",
+        "解释",
+        "应用",
+        "代码",
+        "示例",
+        "例子",
+    )
+    return any(subject in normalized for subject in subjects) and any(
+        intent in normalized for intent in intents
+    )
+
+
+def _looks_like_short_followup(text: str) -> bool:
+    normalized = _normalized_message_text(text)
+    if not normalized:
+        return False
+    if _is_standalone_named_question(text):
+        return False
+    if normalized in {"你是谁", "help", "/help", "帮助"}:
+        return False
+    return len(normalized) <= 48
+
+
+def _should_attach_recent_context(envelope: dict[str, Any]) -> bool:
+    """Only inject same-user history when the current turn actually depends on it."""
+    text = str(envelope.get("content", "") or "")
+    if _is_standalone_named_question(text):
+        return False
+    return _asks_for_recent_context(text) or _looks_like_short_followup(text)
+
+
+def _memory_event_ts_ms(*, envelope: dict[str, Any], role: str) -> int:
+    if role == "user":
+        try:
+            return int(envelope.get("ts_ms") or time.time() * 1000)
+        except (TypeError, ValueError):
+            return int(time.time() * 1000)
+    return int(time.time() * 1000)
+
+
+def _is_feedback_command(envelope: dict[str, Any]) -> bool:
+    command = str(envelope.get("command", "") or "").strip().lower()
+    return command.split("@", 1)[0] == "/feedback"
+
+
+def _parse_feedback_args(args: str) -> tuple[str, str]:
+    text = str(args or "").strip()
+    if not text:
+        return "", ""
+    request_id, _, comment = text.partition(" ")
+    return request_id.strip(), comment.strip()
+
+
+def _feedback_context_from_callback(callback: dict[str, Any]) -> dict[str, str]:
+    msg = callback.get("message")
+    if not isinstance(msg, dict):
+        return {}
+    context: dict[str, str] = {}
+    chat = msg.get("chat")
+    if isinstance(chat, dict):
+        chat_id = chat.get("id")
+        chat_type = str(chat.get("type", "")).lower()
+        if chat_id is not None:
+            context["channel_id"] = str(chat_id)
+            if chat_type in {"group", "supergroup", "channel"}:
+                context["guild_id"] = str(chat_id)
+    thread_id = msg.get("message_thread_id")
+    if thread_id is not None:
+        context["thread_id"] = str(thread_id)
+    return context
+
+
+def _first_send_reply_to_message_id(send_reqs: list[dict[str, Any]]) -> str:
+    for req in send_reqs:
+        if not isinstance(req, dict):
+            continue
+        payload = req.get("payload")
+        if isinstance(payload, dict) and payload.get("reply_to_message_id") is not None:
+            return str(payload.get("reply_to_message_id"))
+    return ""
+
+
+def _debug_info_needs(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in value[:8]:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "kind": str(item.get("kind", "")),
+                "question": str(item.get("question", ""))[:240],
+                "required": bool(item.get("required", False)),
+            }
+        )
+    return rows
+
+
+def _debug_node_timings(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in value[-40:]:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "node": str(item.get("node", "")),
+                "elapsed_ms": _int_like(item.get("elapsed_ms", 0)),
+            }
+        )
+    return rows
+
+
+def _debug_llm_trace(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in value[-40:]:
+        if not isinstance(item, dict):
+            continue
+        usage = item.get("usage", {})
+        if not isinstance(usage, dict):
+            usage = {}
+        rows.append(
+            {
+                "node": str(item.get("node", "")),
+                "kind": str(item.get("kind", "")),
+                "model": str(item.get("model", "")),
+                "tier": str(item.get("tier", "")),
+                "reasoning_effort": str(item.get("reasoning_effort", "")),
+                "json_mode": bool(item.get("json_mode", False)),
+                "max_tokens": _int_like(item.get("max_tokens", 0)),
+                "elapsed_ms": _int_like(item.get("elapsed_ms", 0)),
+                "usage": {
+                    "input_tokens": _int_like(usage.get("input_tokens", 0)),
+                    "output_tokens": _int_like(usage.get("output_tokens", 0)),
+                    "total_tokens": _int_like(usage.get("total_tokens", 0)),
+                },
+            }
+        )
+    return rows
+
+
+def _debug_llm_usage_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result = {
+        "calls": _int_like(value.get("calls", 0)),
+        "elapsed_ms": _int_like(value.get("elapsed_ms", 0)),
+        "input_tokens": _int_like(value.get("input_tokens", 0)),
+        "output_tokens": _int_like(value.get("output_tokens", 0)),
+        "total_tokens": _int_like(value.get("total_tokens", 0)),
+        "by_node": {},
+    }
+    by_node = value.get("by_node", {})
+    if isinstance(by_node, dict):
+        result["by_node"] = {
+            str(node): {
+                "calls": _int_like(row.get("calls", 0)) if isinstance(row, dict) else 0,
+                "elapsed_ms": _int_like(row.get("elapsed_ms", 0)) if isinstance(row, dict) else 0,
+                "input_tokens": _int_like(row.get("input_tokens", 0)) if isinstance(row, dict) else 0,
+                "output_tokens": _int_like(row.get("output_tokens", 0)) if isinstance(row, dict) else 0,
+                "total_tokens": _int_like(row.get("total_tokens", 0)) if isinstance(row, dict) else 0,
+            }
+            for node, row in by_node.items()
+        }
+    return result
+
+
+def _debug_time_budget(*, result: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    budget = state.get("budget", {})
+    if not isinstance(budget, dict):
+        budget = {}
+    started_ms = _int_like(result.get("_request_started_ts_ms") or state.get("_request_started_ts_ms"), 0)
+    elapsed_ms = _int_like(result.get("_graph_elapsed_ms", 0))
+    if elapsed_ms <= 0 and started_ms > 0:
+        elapsed_ms = max(0, int(time.time() * 1000) - started_ms)
+    target_ms = _int_like(budget.get("target_elapsed_ms", 0))
+    max_ms = _int_like(budget.get("max_elapsed_ms", 0))
+    return {
+        "elapsed_ms": elapsed_ms,
+        "target_elapsed_ms": target_ms,
+        "max_elapsed_ms": max_ms,
+        "remaining_target_ms": max(0, target_ms - elapsed_ms) if target_ms > 0 else 0,
+        "remaining_max_ms": max(0, max_ms - elapsed_ms) if max_ms > 0 else 0,
+    }
+
+
+def _int_like(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _context_ids(context: dict[str, Any]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for key in ("guild_id", "channel_id", "thread_id"):
+        value = context.get(key)
+        if value is not None and str(value).strip():
+            result[key] = str(value)
+    return result
+
+
+def _feedback_fields_from_answer(answer: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(answer, dict):
+        return {
+            "trace_summary": "",
+            "tool_calls": 0,
+            "evidence_count": 0,
+            "final_text_preview": "",
+        }
+    return {
+        "trace_summary": str(answer.get("trace_summary", "") or ""),
+        "tool_calls": _int_or_zero(answer.get("tool_calls")),
+        "evidence_count": _int_or_zero(answer.get("evidence_count")),
+        "final_text_preview": str(answer.get("final_text_preview", "") or ""),
+    }
+
+
+def _build_answer_feedback_record(
+    *,
+    result: dict[str, Any],
+    state: dict[str, Any],
+    envelope: dict[str, Any],
+    outbound: dict[str, Any],
+    sent_count: int,
+    has_csat: bool,
+) -> dict[str, Any]:
+    response = result.get("_final_response")
+    if not isinstance(response, dict):
+        response = {}
+    context = envelope.get("context", {})
+    if not isinstance(context, dict):
+        context = {}
+    request_id = str(state.get("request_id") or response.get("request_id") or "unknown")
+    return {
+        "request_id": request_id,
+        "platform": "telegram",
+        "chat_id": str(context.get("channel_id") or context.get("guild_id") or ""),
+        "user_id": str(context.get("user_id", "")),
+        "created_ts_ms": int(time.time() * 1000),
+        "trace_summary": str(
+            response.get("trace_summary")
+            or result.get("_tool_execution_summary")
+            or state.get("_tool_execution_summary")
+            or ""
+        ),
+        "tool_calls": _infer_tool_calls(result=result, state=state),
+        "evidence_count": _infer_evidence_count(result=result, state=state, response=response),
+        "final_text_preview": _outbound_text_preview(outbound),
+        "sent_count": int(sent_count),
+        "has_csat": bool(has_csat),
+        "answer_char_count": sum(
+            int(seg.get("char_count", len(str(seg.get("text", "")))))
+            for seg in outbound.get("segments", [])
+            if isinstance(seg, dict)
+        ),
+        **_context_ids(context),
+    }
+
+
+def _infer_tool_calls(*, result: dict[str, Any], state: dict[str, Any]) -> int:
+    for value in (
+        result.get("_tool_calls_executed"),
+        state.get("_tool_calls_executed"),
+    ):
+        if value is not None:
+            return _int_or_zero(value)
+    trace = result.get("_tool_execution_trace") or state.get("_tool_execution_trace")
+    if isinstance(trace, list):
+        return len(trace)
+    return 0
+
+
+def _infer_evidence_count(
+    *,
+    result: dict[str, Any],
+    state: dict[str, Any],
+    response: dict[str, Any],
+) -> int:
+    for value in (
+        result.get("evidence_count"),
+        state.get("evidence_count"),
+    ):
+        if value is not None:
+            return _int_or_zero(value)
+    evidence = result.get("evidence") or state.get("evidence")
+    if isinstance(evidence, list):
+        return len(evidence)
+    citations = response.get("citations")
+    if isinstance(citations, list):
+        return len(citations)
+    return 0
+
+
+def _outbound_text_preview(outbound: dict[str, Any], limit: int = 300) -> str:
+    chunks = []
+    for seg in outbound.get("segments", []):
+        if isinstance(seg, dict):
+            chunks.append(str(seg.get("text", "") or ""))
+    return "\n".join(chunks).strip()[:limit]
+
+
+def _send_text_request(
+    *,
+    chat_id: str | None,
+    text: str,
+    envelope: dict[str, Any],
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "chat_id": _coerce_numeric_or_keep(chat_id or ""),
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    context = envelope.get("context", {})
+    if isinstance(context, dict) and context.get("thread_id") is not None:
+        payload["message_thread_id"] = _coerce_numeric_or_keep(context["thread_id"])
+    return {"method": "sendMessage", "payload": payload}
+
+
+def _coerce_numeric_or_keep(value: Any) -> Any:
+    text = str(value)
+    if text.lstrip("-").isdigit():
+        try:
+            return int(text)
+        except ValueError:
+            return text
+    return text
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _build_outbound_from_graph_result(
+    *,
+    result: dict[str, Any],
+    state: dict[str, Any],
+    envelope: dict[str, Any],
+    render_mode: str,
+    append_csat: bool,
+) -> dict[str, Any]:
+    outbound = result.get("_outbound_message")
+    if isinstance(outbound, dict) and isinstance(outbound.get("segments"), list):
+        # Telegram replies should point to the user's current message. When a
+        # user triggers the bot by replying to a previous bot answer, the
+        # envelope also contains reply_to_message_id, but using that would make
+        # Telegram render the bot as replying to itself.
+        if envelope.get("message_id"):
+            outbound["reply_to_message_id"] = str(envelope.get("message_id"))
+        return outbound
+
+    response = result.get("_final_response")
+    if not isinstance(response, dict):
+        response = {}
+    response.setdefault("request_id", str(state.get("request_id", "unknown")))
+    response.setdefault("text", "")
+    response.setdefault("citations", [])
+
+    out = format_response_to_outbound(
+        response=response,
+        context=envelope["context"],  # type: ignore[arg-type]
+        render_mode="plain" if render_mode == "plain" else "markdown",  # type: ignore[arg-type]
+        append_csat=bool(append_csat),
+        reply_to_message_id=str(envelope.get("message_id") or "") or None,
+    )
+    if out.get("segments"):
+        return out
+
+    req_id = str(response.get("request_id", "unknown"))
+    out["segments"] = [
+        {
+            "segment_id": f"{req_id}:0",
+            "index": 0,
+            "text": "(empty response)",
+            "char_count": len("(empty response)"),
+            "citation_labels": [],
+        }
+    ]
+    return out
+

@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "crawl_key": {
+    "mode": "topic",
+    "base_url": "https://talk.nervos.org",
+    "category_slug": "",
+    "latest_pages": null,
+    "max_pages": null,
+    "topic_ids_hash": "00ad7e2e78ec717c"
+  },
+  "topic_ids": [
+    10164
+  ],
+  "completed_topic_ids": [
+    10164
+  ],
+  "failed_topics": {},
+  "created_ts_ms": 1775712725751,
+  "updated_ts_ms": 1775712731412
+}
