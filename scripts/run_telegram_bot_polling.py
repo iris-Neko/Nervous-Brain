@@ -151,7 +151,11 @@ def _build_runtime(*, model: str, memory_db: Path) -> tuple[FullGraphRuntime, Me
         )
 
     memory_db.parent.mkdir(parents=True, exist_ok=True)
-    engine = create_engine(f"sqlite+pysqlite:///{memory_db}", future=True)
+    engine = create_engine(
+        f"sqlite+pysqlite:///{memory_db}",
+        connect_args={"check_same_thread": False},
+        future=True,
+    )
     init_memory_schema(engine)
     memory_service = MemoryService(build_session_factory(engine))
 
@@ -278,6 +282,12 @@ def main() -> int:
         help="Recent same-user same-chat message events injected into graph state.",
     )
     parser.add_argument(
+        "--max-worker-threads",
+        type=int,
+        default=_cfg_int(bot_cfg, "max_worker_threads", 4),
+        help="Concurrent Telegram update worker threads; same chat/user updates stay ordered.",
+    )
+    parser.add_argument(
         "--target-elapsed-ms",
         type=int,
         default=_cfg_int(bot_cfg, "target_elapsed_ms", 30000),
@@ -385,6 +395,7 @@ def main() -> int:
         bot_username=str(username or ""),
         target_elapsed_ms=max(0, int(args.target_elapsed_ms)),
         max_elapsed_ms=max(0, int(args.max_elapsed_ms)),
+        max_worker_threads=max(1, int(args.max_worker_threads)),
     )
     logger.info(
         "Telegram beta controls: allowed_chat_ids=%s append_csat=%s mention_only_in_group=%s respond_to_bot_replies=%s feedback_file=%s debug_log_file=%s",

@@ -528,6 +528,34 @@ def test_retriever_vector_path(populated_retriever):
     assert "anchor" in e and "title" in e and "score" in e and "snippet" in e
 
 
+def test_retriever_broad_resource_query_uses_vector_without_filters(monkeypatch, populated_retriever):
+    calls: list[dict] = []
+
+    def fake_vector_search(query, filters, top_k):
+        calls.append({"query": query, "filters": filters, "top_k": top_k})
+        return [
+            {
+                "anchor": "doc:resources#chunk:0",
+                "title": "CKB learning resources",
+                "source": "docs",
+                "score": 0.99,
+            }
+        ]
+
+    def fail_slow_path(*_args, **_kwargs):
+        raise AssertionError("broad resource query should not run slow archive paths")
+
+    monkeypatch.setattr(populated_retriever, "_vector_search", fake_vector_search)
+    monkeypatch.setattr(populated_retriever, "_bm25_search", fail_slow_path)
+    monkeypatch.setattr(populated_retriever, "_fuzzy_search", fail_slow_path)
+    monkeypatch.setattr(populated_retriever, "_exact_search", fail_slow_path)
+
+    results = populated_retriever.search("CKB 入门有没有比较靠谱的资料可以看？", top_k=3)
+
+    assert results
+    assert calls[0]["filters"] == {}
+
+
 def test_retriever_returns_evidence_protocol(populated_retriever):
     results = populated_retriever.search("HTLC timeout")
     for e in results:

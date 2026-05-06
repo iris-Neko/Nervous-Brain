@@ -15,6 +15,7 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -68,6 +69,7 @@ class TelegramBotAPI:
     ) -> None:
         self._cfg = config
         self._session = session or requests.Session()
+        self._call_lock = threading.Lock()
 
     @property
     def api_base(self) -> str:
@@ -84,13 +86,14 @@ class TelegramBotAPI:
         timeout_s: float = 30.0,
     ) -> Any:
         try:
-            resp = self._session.post(
-                self._method_url(method),
-                json=payload or {},
-                timeout=timeout_s,
-            )
-            resp.raise_for_status()
-            body = resp.json()
+            with self._call_lock:
+                resp = self._session.post(
+                    self._method_url(method),
+                    json=payload or {},
+                    timeout=timeout_s,
+                )
+                resp.raise_for_status()
+                body = resp.json()
         except requests.RequestException as exc:
             detail = _redact_telegram_error(str(exc), self._cfg.bot_token)
             raise TelegramBotRuntimeError(
@@ -308,6 +311,7 @@ class TelegramPollingGateway:
         bot_username: str | None = None,
         target_elapsed_ms: int = 30000,
         max_elapsed_ms: int = 90000,
+        max_worker_threads: int = 1,
     ) -> None:
         self._api = api
         self._graph_runner = graph_runner
@@ -327,6 +331,9 @@ class TelegramPollingGateway:
         self._bot_username = str(bot_username or "").lstrip("@").strip()
         self._target_elapsed_ms = max(0, int(target_elapsed_ms or 0))
         self._max_elapsed_ms = max(0, int(max_elapsed_ms or 0))
+        self._max_worker_threads = max(1, min(int(max_worker_threads or 1), 32))
+        self._debug_write_lock = threading.Lock()
+        self._feedback_lock = threading.Lock()
 
     @property
     def next_offset(self) -> int | None:
@@ -355,30 +362,37 @@ class TelegramPollingGateway:
 
         rows: list[dict[str, Any]] = []
         max_seen: int | None = None
-        for update in updates:
+        indexed_updates: list[tuple[int, dict[str, Any]]] = []
+        for idx, update in enumerate(updates):
             uid = _extract_update_id(update)
             if uid is not None:
                 max_seen = uid if max_seen is None else max(max_seen, uid)
-            try:
-                rows.append(self.process_update(update, dry_run=dry_run))
-            except Exception as exc:
-                logger.exception(
-                    "telegram process_update failed; advancing offset to avoid duplicate LLM calls "
-                    "update_id=%s error=%s",
-                    uid,
-                    exc,
-                )
-                rows.append(
-                    {
-                        "update_id": uid,
-                        "chat_id": _extract_chat_id_from_update(update),
-                        "ignored": False,
-                        "reason": "process_update_failed",
-                        "request_id": None,
-                        "sent_count": 0,
-                        "error": str(exc),
-                    }
-                )
+            indexed_updates.append((idx, update))
+
+        if self._max_worker_threads <= 1 or len(indexed_updates) <= 1:
+            rows = [self._process_update_safely(update, dry_run=dry_run) for _, update in indexed_updates]
+        else:
+            rows_by_index: list[dict[str, Any] | None] = [None] * len(indexed_updates)
+            groups = _group_updates_by_conversation(indexed_updates)
+            worker_count = min(self._max_worker_threads, len(groups))
+            logger.debug(
+                "telegram poll_once concurrent processing updates=%d groups=%d workers=%d",
+                len(indexed_updates),
+                len(groups),
+                worker_count,
+            )
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="telegram-update-worker",
+            ) as pool:
+                futures = [
+                    pool.submit(self._process_update_group, group, dry_run=dry_run)
+                    for group in groups
+                ]
+                for future in as_completed(futures):
+                    for idx, row in future.result():
+                        rows_by_index[idx] = row
+            rows = [row for row in rows_by_index if row is not None]
 
         if max_seen is not None:
             self._next_offset = max_seen + 1
@@ -386,6 +400,43 @@ class TelegramPollingGateway:
                 self._offset_store.save(self._next_offset)
         logger.debug("telegram poll_once: updates=%d next_offset=%s", len(rows), self._next_offset)
         return rows
+
+    def _process_update_group(
+        self,
+        group: list[tuple[int, dict[str, Any]]],
+        *,
+        dry_run: bool,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        rows: list[tuple[int, dict[str, Any]]] = []
+        for idx, update in group:
+            rows.append((idx, self._process_update_safely(update, dry_run=dry_run)))
+        return rows
+
+    def _process_update_safely(
+        self,
+        update: dict[str, Any],
+        *,
+        dry_run: bool,
+    ) -> dict[str, Any]:
+        uid = _extract_update_id(update)
+        try:
+            return self.process_update(update, dry_run=dry_run)
+        except Exception as exc:
+            logger.exception(
+                "telegram process_update failed; advancing offset to avoid duplicate LLM calls "
+                "update_id=%s error=%s",
+                uid,
+                exc,
+            )
+            return {
+                "update_id": uid,
+                "chat_id": _extract_chat_id_from_update(update),
+                "ignored": False,
+                "reason": "process_update_failed",
+                "request_id": None,
+                "sent_count": 0,
+                "error": str(exc),
+            }
 
     def process_update(
         self,
@@ -529,16 +580,17 @@ class TelegramPollingGateway:
         if not dry_run:
             sent_count = self._api.send_requests(send_reqs)
             if self._feedback_store is not None:
-                self._feedback_store.append_answer(
-                    _build_answer_feedback_record(
-                        result=result,
-                        state=state,
-                        envelope=envelope,
-                        outbound=outbound,
-                        sent_count=sent_count,
-                        has_csat=bool(self._append_csat and send_reqs),
+                with self._feedback_lock:
+                    self._feedback_store.append_answer(
+                        _build_answer_feedback_record(
+                            result=result,
+                            state=state,
+                            envelope=envelope,
+                            outbound=outbound,
+                            sent_count=sent_count,
+                            has_csat=bool(self._append_csat and send_reqs),
+                        )
                     )
-                )
         self._write_debug_event(
             update=update,
             update_id=update_id,
@@ -684,11 +736,10 @@ class TelegramPollingGateway:
         if not isinstance(sender, dict):
             sender = {}
         context = _feedback_context_from_callback(callback)
-        answer_meta = (
-            self._feedback_store.latest_answer(parsed.request_id)
-            if self._feedback_store is not None
-            else None
-        )
+        answer_meta = None
+        if self._feedback_store is not None:
+            with self._feedback_lock:
+                answer_meta = self._feedback_store.latest_answer(parsed.request_id)
         answer_fields = _feedback_fields_from_answer(answer_meta)
         preview = answer_fields.get("final_text_preview") or _message_text_preview(msg)
         record = {
@@ -704,7 +755,8 @@ class TelegramPollingGateway:
             **context,
         }
         if self._feedback_store is not None and not dry_run:
-            record = self._feedback_store.append(record)
+            with self._feedback_lock:
+                record = self._feedback_store.append(record)
 
         if not dry_run and callback_id:
             duplicate = bool(record.get("is_duplicate_rating", False))
@@ -863,9 +915,10 @@ class TelegramPollingGateway:
                     or ""
                 ),
             }
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+            with self._debug_write_lock:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
         except Exception as exc:
             logger.debug("telegram debug event write failed: %s", exc)
 
@@ -948,6 +1001,46 @@ def _extract_chat_id_from_message(msg: dict[str, Any]) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _conversation_key_from_update(update: dict[str, Any]) -> str:
+    chat_id = _extract_chat_id_from_update(update)
+    user_id = _extract_user_id_from_update(update)
+    if chat_id is None:
+        callback = _extract_callback_query(update)
+        if isinstance(callback, dict):
+            callback_id = str(callback.get("id", "") or "")
+            return f"callback:{callback_id or _extract_update_id(update) or 'unknown'}"
+        return f"update:{_extract_update_id(update) or 'unknown'}"
+    return f"chat:{chat_id}:user:{user_id or 'unknown'}"
+
+
+def _extract_user_id_from_update(update: dict[str, Any]) -> str | None:
+    msg = _extract_message_payload(update)
+    if isinstance(msg, dict):
+        sender = msg.get("from") or msg.get("sender_chat")
+        if isinstance(sender, dict) and sender.get("id") is not None:
+            return str(sender["id"])
+    callback = _extract_callback_query(update)
+    if isinstance(callback, dict):
+        sender = callback.get("from")
+        if isinstance(sender, dict) and sender.get("id") is not None:
+            return str(sender["id"])
+    return None
+
+
+def _group_updates_by_conversation(
+    indexed_updates: list[tuple[int, dict[str, Any]]],
+) -> list[list[tuple[int, dict[str, Any]]]]:
+    groups_by_key: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    key_order: list[str] = []
+    for item in indexed_updates:
+        key = _conversation_key_from_update(item[1])
+        if key not in groups_by_key:
+            groups_by_key[key] = []
+            key_order.append(key)
+        groups_by_key[key].append(item)
+    return [groups_by_key[key] for key in key_order]
 
 
 def _message_text_preview(msg: Any, limit: int = 300) -> str:

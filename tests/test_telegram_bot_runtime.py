@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -723,6 +725,68 @@ def test_poll_once_advances_and_persists_offset(tmp_path: Path):
     assert len(rows) == 2
     assert gateway.next_offset == 203
     assert store.load() == 203
+
+
+def test_poll_once_processes_different_users_concurrently(tmp_path: Path):
+    updates = [
+        _sample_update(update_id=210, chat_id=-100123, user_id=1, text="@NBCKB_Bot first"),
+        _sample_update(update_id=211, chat_id=-100123, user_id=2, text="@NBCKB_Bot second"),
+    ]
+    fake_api = _FakeAPI(updates=updates)
+    store = TelegramUpdateOffsetStore(tmp_path / "tg_offset.txt")
+    release = threading.Event()
+    started: list[int] = []
+    lock = threading.Lock()
+
+    def graph_runner(state: dict[str, Any]) -> dict[str, Any]:
+        context = state["user_message"]["context"]
+        with lock:
+            started.append(int(context["user_id"]))
+            if len(started) == 2:
+                release.set()
+        assert release.wait(1.0)
+        return {"_final_response": {"request_id": state["request_id"], "text": "ok"}}
+
+    gateway = TelegramPollingGateway(
+        api=fake_api,  # type: ignore[arg-type]
+        graph_runner=graph_runner,
+        offset_store=store,
+        max_worker_threads=2,
+    )
+
+    rows = gateway.poll_once(dry_run=True, timeout_s=0, limit=10)
+
+    assert [row["update_id"] for row in rows] == [210, 211]
+    assert sorted(started) == [1, 2]
+    assert gateway.next_offset == 212
+    assert store.load() == 212
+
+
+def test_poll_once_preserves_same_chat_user_order():
+    updates = [
+        _sample_update(update_id=220, chat_id=-100123, user_id=7, text="@NBCKB_Bot first"),
+        _sample_update(update_id=221, chat_id=-100123, user_id=7, text="@NBCKB_Bot second"),
+    ]
+    fake_api = _FakeAPI(updates=updates)
+    seen: list[str] = []
+
+    def graph_runner(state: dict[str, Any]) -> dict[str, Any]:
+        content = str(state["user_message"]["content"])
+        if "first" in content:
+            time.sleep(0.05)
+        seen.append(content)
+        return {"_final_response": {"request_id": state["request_id"], "text": "ok"}}
+
+    gateway = TelegramPollingGateway(
+        api=fake_api,  # type: ignore[arg-type]
+        graph_runner=graph_runner,
+        max_worker_threads=4,
+    )
+
+    rows = gateway.poll_once(dry_run=True, timeout_s=0, limit=10)
+
+    assert [row["update_id"] for row in rows] == [220, 221]
+    assert seen == ["first", "second"]
 
 
 def test_send_requests_retries_markdown_failure_as_plain_text():

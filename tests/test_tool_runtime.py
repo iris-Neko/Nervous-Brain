@@ -84,6 +84,7 @@ class TestToolWhitelistAndSchema:
         )
         assert req["tool"] == "qdrant_search"
         assert req["deadline_ts_ms"] > req["issued_ts_ms"]
+        assert req["timeout_ms"] == 60_000
 
 
 class TestIdempotencyKey:

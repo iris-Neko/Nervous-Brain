@@ -59,6 +59,27 @@ def _has_user_clarification_hint(state: dict[str, Any]) -> bool:
     clarify_question = str(hints.get("clarify_question", "") or "").strip()
     if not clarify_question:
         return False
+    text = clarify_question.lower()
+    user_owned_markers = (
+        "你的",
+        "您",
+        "你使用",
+        "报错",
+        "日志",
+        "代码",
+        "配置",
+        "运行环境",
+        "系统",
+        "版本号",
+        "目标语言",
+        "sdk 语言",
+        "钱包",
+        "地址",
+        "私有",
+        "业务",
+    )
+    if not any(marker in text for marker in user_owned_markers):
+        return False
     missing_params = hints.get("missing_params", [])
     if isinstance(missing_params, list):
         return any(str(item).strip() for item in missing_params)
@@ -99,6 +120,9 @@ class FullGraphState(GraphState, total=False):
     _memory_service: Any
     _provider_registry: Any
     _provider_max_cost: str
+    _archive_store: Any
+    _tool_transport: Any
+    _mcp_transport: Any
 
     # Optional runtime controls from gateway.
     render_mode: str
@@ -146,7 +170,7 @@ def route_after_assessment(state: FullGraphState) -> str:
     """InfoGapAssessor 之后的路由。"""
     decision = state.get("_route_decision", "has_needs")
     if decision == "ask_user":
-        return "ask_user"
+        return "ask_user" if _has_required_info_need(state) else "answer_composer"
     elif decision == "answer_direct":
         return "answer_composer"
     else:
@@ -213,7 +237,11 @@ def route_after_self_check(state: FullGraphState) -> str:
     if decision == "accept_answer":
         return "format_repair"
     if decision == "ask_user":
-        return "ask_user"
+        if _has_required_info_need(state) or _has_user_clarification_hint(state):
+            return "ask_user"
+        if _has_evidence(state):
+            return "answer_composer"
+        return "retriever_planner"
     if decision == "continue_retrieval":
         return "retriever_planner"
     if decision == "revise_answer":

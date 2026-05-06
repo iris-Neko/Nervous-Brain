@@ -24,6 +24,11 @@ from nervos_brain.response_normalizer.platform_formatter import format_response_
 from . import prompts
 from .llm import call_llm, call_llm_json, get_last_call_meta
 from .provider_registry import ProviderCapabilityRegistry
+from .source_registry import (
+    format_source_registry_for_prompt,
+    normalize_tool_filters,
+    should_retry_qdrant_without_filters,
+)
 
 _ANSWER_COMPOSER_FALLBACK_TEXT = "证据已收集，但回答生成暂时失败，请稍后重试。"
 _DIRECT_ANSWER_FALLBACK_TEXT = "我可以直接回答低风险问题，但这次生成暂时失败了，请稍后重试。"
@@ -402,6 +407,82 @@ def _tool_args_for_step(
         return args
 
     return None
+
+
+def _execute_retrieval_tool_call(
+    *,
+    request_id: str,
+    step_id: str,
+    tool: str,
+    args: dict[str, Any],
+    build_tool_call_request: Any,
+    check_idempotency: Any,
+    execute_tool: Any,
+    handlers: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any], bool]:
+    try:
+        req = build_tool_call_request(
+            request_id=request_id,
+            step_id=step_id,
+            tool=tool,
+            args=args,
+        )
+    except ValueError as exc:
+        return None, {
+            "step_id": step_id,
+            "tool": str(tool),
+            "status": "error",
+            "error_code": "ERR_TOOL_SCHEMA_INVALID",
+            "error_message": str(exc)[:200],
+            "evidence_count": 0,
+        }, False
+
+    if check_idempotency(req["idempotency_key"]):
+        return None, {
+            "step_id": step_id,
+            "tool": str(tool),
+            "status": "duplicate",
+            "evidence_count": 0,
+        }, False
+
+    handler = handlers.get(tool)
+    if handler is None:
+        return None, {
+            "step_id": step_id,
+            "tool": str(tool),
+            "status": "error",
+            "error_code": "ERR_MCP_TRANSPORT_UNAVAILABLE",
+            "evidence_count": 0,
+        }, False
+
+    try:
+        result = _run_async_sync(execute_tool(req, handler))
+    except Exception as exc:
+        return None, {
+            "step_id": step_id,
+            "tool": str(tool),
+            "status": "error",
+            "error_code": "ERR_TOOL_EXECUTION_FAILED",
+            "error_message": str(exc)[:200],
+            "evidence_count": 0,
+        }, False
+
+    evidence_items = result.get("evidence", []) if isinstance(result, dict) else []
+    evidence_count = len(evidence_items) if isinstance(evidence_items, list) else 0
+    trace_row = {
+        "step_id": step_id,
+        "tool": str(tool),
+        "status": "empty" if result.get("ok") and evidence_count == 0 else str(result.get("status", "error")),
+        "evidence_count": evidence_count,
+        "latency_ms": max(
+            0,
+            _int_like(result.get("finished_ts_ms", 0)) - _int_like(result.get("started_ts_ms", 0)),
+        ),
+    }
+    if isinstance(result.get("error"), dict):
+        trace_row["error_code"] = str(result["error"].get("code", ""))
+        trace_row["error_message"] = str(result["error"].get("message", ""))
+    return result, trace_row, True
 
 
 def _tool_trace_summary(traces: list[dict[str, Any]]) -> str:
@@ -861,6 +942,30 @@ def _looks_like_new_user_intent(text: str) -> bool:
     return any(marker in normalized for marker in markers)
 
 
+def _looks_like_response_quality_feedback(text: str) -> bool:
+    """Detect short feedback about the bot's previous answer, not a new search task."""
+    normalized = re.sub(r"\s+", "", str(text or "").lower())
+    if not normalized:
+        return False
+    markers = (
+        "回复错问题",
+        "答非所问",
+        "不是这个问题",
+        "不是问这个",
+        "你理解错了",
+        "理解错了",
+        "回答错了",
+        "回复错了",
+        "回错了",
+        "跑题了",
+        "没回答我的问题",
+        "不是我要问的",
+        "你是不是回复错",
+        "是不是回复错",
+    )
+    return any(marker in normalized for marker in markers)
+
+
 def _looks_like_checkpoint_answer(text: str, checkpoint: dict[str, object]) -> bool:
     normalized = re.sub(r"\s+", "", text.lower())
     if not normalized:
@@ -1040,29 +1145,17 @@ def _call_llm_with_retry(
 def _normalize_ask_user_question(raw: str) -> str:
     text = re.sub(r"\s+", " ", str(raw or "")).strip()
     if not text:
-        return "请问您能提供更多信息吗？"
+        return ""
 
     # Keep text concise and avoid overlong noisy prompts.
     if len(text) > 220:
         text = text[:220].rstrip() + "…"
 
-    generic_uncertainty_markers = (
-        "当前信息存在不确定性",
-        "补充具体版本、环境或目标",
-        "补充具体版本、运行环境或目标",
-    )
-    if any(marker in text for marker in generic_uncertainty_markers):
-        return "请补充具体版本、运行环境或你想实现的目标，可以吗？"
-
     question_markers = ("？", "?", "吗", "呢", "是否", "可否", "能否")
     if any(marker in text for marker in question_markers):
         return text
 
-    if text.startswith(("请", "您", "你")):
-        return text + "？"
-
-    # Convert noun phrase / topic phrase into an explicit clarification question.
-    return f"为了准确回答，我先确认一下：你是想了解“{text}”吗？"
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -1082,6 +1175,20 @@ def info_gap_assessor(state: dict) -> dict:
     question = _merge_checkpoint_question(raw_question, checkpoint)
     recent_messages = _load_recent_messages(state)
     conversation_context = _format_conversation_context(recent_messages)
+
+    if _looks_like_response_quality_feedback(raw_question):
+        if checkpoint is not None:
+            _complete_thread_checkpoint(state)
+        return {
+            "_route_decision": "answer_direct",
+            "retrieval_policy": "none",
+            "info_needs": [],
+            "memory_facts": facts,
+            "recent_messages": recent_messages,
+            "conversation_context": conversation_context,
+            "resolved_question": raw_question,
+            "budget": _merge_policy_budget(state, "none"),
+        }
 
     user_prompt = prompts.INFO_GAP_USER.format(
         question=question,
@@ -1132,6 +1239,8 @@ def info_gap_assessor(state: dict) -> dict:
 
     decision = _normalized_decision(result.get("decision", "has_needs"))
     info_needs = _normalize_info_needs_schema(result.get("info_needs", []))
+    if decision == "ask_user" and not _required_questions(info_needs):
+        decision = "has_needs" if info_needs else "answer_direct"
 
     retrieval_policy = _normalize_retrieval_policy(
         result.get("retrieval_policy"),
@@ -1228,9 +1337,14 @@ def retriever_planner(state: dict) -> dict:
         require_json=True,
         fallback_tier="low",
     )
+    planner_system_prompt = (
+        prompts.RETRIEVER_PLANNER_SYSTEM
+        + "\n\n可用 source registry:\n"
+        + format_source_registry_for_prompt()
+    )
     try:
         plan = _call_llm_json_with_profile(
-            prompts.RETRIEVER_PLANNER_SYSTEM,
+            planner_system_prompt,
             user_prompt,
             profile,
         )
@@ -1279,15 +1393,17 @@ def retriever_planner(state: dict) -> dict:
         step_top_k = max(1, min(step_top_k, 20))
         raw_tool = str(raw_step.get("tool", "qdrant_search")).strip() or "qdrant_search"
         tool = raw_tool if raw_tool in supported_tools else "qdrant_search"
+        raw_filters = raw_step.get("filters", {}) if isinstance(raw_step.get("filters", {}), dict) else {}
+        filters, filter_notes = normalize_tool_filters(tool, raw_filters)
         step = {
             "step_id": str(raw_step.get("step_id", f"step_{uuid.uuid4().hex[:4]}")),
             "tool": tool,
             "query": str(raw_step.get("query", question)).strip() or question,
-            "filters": raw_step.get("filters", {})
-            if isinstance(raw_step.get("filters", {}), dict)
-            else {},
+            "filters": filters,
             "top_k": step_top_k,
         }
+        if filter_notes:
+            step["filter_notes"] = filter_notes
         time_range = str(raw_step.get("time_range", "") or "").strip()
         if time_range:
             step["time_range"] = time_range
@@ -1371,7 +1487,8 @@ def retrieval_executor(state: dict) -> dict:
 
         tool = step.get("tool", "qdrant_search")
         query = str(step.get("query", ""))
-        filters = step.get("filters", {}) if isinstance(step.get("filters", {}), dict) else {}
+        raw_filters = step.get("filters", {}) if isinstance(step.get("filters", {}), dict) else {}
+        filters, filter_notes = normalize_tool_filters(str(tool), raw_filters)
         top_k = step.get("top_k", 5)
         try:
             top_k = int(top_k)
@@ -1400,82 +1517,53 @@ def retrieval_executor(state: dict) -> dict:
             )
             continue
 
-        try:
-            req = build_tool_call_request(
-                request_id=request_id,
-                step_id=step_id,
-                tool=tool,
-                args=args,
-            )
-        except ValueError as exc:
-            tool_traces.append(
-                {
-                    "step_id": step_id,
-                    "tool": str(tool),
-                    "status": "error",
-                    "error_code": "ERR_TOOL_SCHEMA_INVALID",
-                    "error_message": str(exc)[:200],
-                    "evidence_count": 0,
-                }
-            )
+        result, trace_row, counted_call = _execute_retrieval_tool_call(
+            request_id=str(request_id),
+            step_id=step_id,
+            tool=str(tool),
+            args=args,
+            build_tool_call_request=build_tool_call_request,
+            check_idempotency=check_idempotency,
+            execute_tool=execute_tool,
+            handlers=TOOL_HANDLERS,
+        )
+        if filter_notes:
+            trace_row["filter_notes"] = filter_notes
+        if counted_call:
+            tool_calls += 1
+        tool_traces.append(trace_row)
+        if result is None:
             continue
 
-        if check_idempotency(req["idempotency_key"]):
-            tool_traces.append(
-                {
-                    "step_id": step_id,
-                    "tool": str(tool),
-                    "status": "duplicate",
-                    "evidence_count": 0,
-                }
-            )
-            continue
-
-        handler = TOOL_HANDLERS.get(tool)
-        if handler is None:
-            tool_traces.append(
-                {
-                    "step_id": step_id,
-                    "tool": str(tool),
-                    "status": "error",
-                    "error_code": "ERR_MCP_TRANSPORT_UNAVAILABLE",
-                    "evidence_count": 0,
-                }
-            )
-            continue
-
-        try:
-            result = _run_async_sync(execute_tool(req, handler))
-        except Exception as exc:
-            tool_traces.append(
-                {
-                    "step_id": step_id,
-                    "tool": str(tool),
-                    "status": "error",
-                    "error_code": "ERR_TOOL_EXECUTION_FAILED",
-                    "error_message": str(exc)[:200],
-                    "evidence_count": 0,
-                }
-            )
-            continue
-
-        tool_calls += 1
         evidence_items = result.get("evidence", []) if isinstance(result, dict) else []
         evidence_count = len(evidence_items) if isinstance(evidence_items, list) else 0
-        trace_row = {
-            "step_id": step_id,
-            "tool": str(tool),
-            "status": "empty" if result.get("ok") and evidence_count == 0 else str(result.get("status", "error")),
-            "evidence_count": evidence_count,
-            "latency_ms": max(
-                0,
-                _int_like(result.get("finished_ts_ms", 0)) - _int_like(result.get("started_ts_ms", 0)),
-            ),
-        }
-        if isinstance(result.get("error"), dict):
-            trace_row["error_code"] = str(result["error"].get("code", ""))
-            trace_row["error_message"] = str(result["error"].get("message", ""))
-        tool_traces.append(trace_row)
+        if (
+            result.get("ok")
+            and str(tool) == "qdrant_search"
+            and should_retry_qdrant_without_filters(filters, evidence_count)
+            and tool_calls < max_tool_calls
+        ):
+            fallback_args = dict(args)
+            fallback_args["filters"] = {}
+            fallback_result, fallback_trace, fallback_counted = _execute_retrieval_tool_call(
+                request_id=str(request_id),
+                step_id=f"{step_id}_unfiltered",
+                tool=str(tool),
+                args=fallback_args,
+                build_tool_call_request=build_tool_call_request,
+                check_idempotency=check_idempotency,
+                execute_tool=execute_tool,
+                handlers=TOOL_HANDLERS,
+            )
+            fallback_trace["fallback_reason"] = "empty_filtered_qdrant_search"
+            tool_traces.append(fallback_trace)
+            if fallback_counted:
+                tool_calls += 1
+            if fallback_result is not None:
+                fallback_items = fallback_result.get("evidence", []) if isinstance(fallback_result, dict) else []
+                if isinstance(fallback_items, list) and fallback_items:
+                    result = fallback_result
+                    evidence_items = fallback_items
 
         if result.get("ok") and isinstance(evidence_items, list):
             existing_evidence.extend(evidence_items)
@@ -1624,12 +1712,32 @@ def _reflection_has_user_required_clarification(
     clarify_question = str(hints.get("clarify_question", "") or "").strip()
     if not clarify_question:
         return False
+    text = clarify_question.lower()
+    user_owned_markers = (
+        "你的",
+        "您",
+        "你使用",
+        "你用",
+        "请贴",
+        "请提供你",
+        "请补充你",
+        "报错",
+        "日志",
+        "代码",
+        "配置",
+        "目标语言",
+        "sdk 语言",
+        "私有",
+        "业务",
+    )
+    if not any(marker in text for marker in user_owned_markers):
+        return False
     missing_params = hints.get("missing_params", [])
-    if isinstance(missing_params, list) and any(str(item).strip() for item in missing_params):
-        return True
-    if isinstance(missing_params, str) and missing_params.strip():
-        return True
-    return False
+    if isinstance(missing_params, list):
+        return any(str(item).strip() for item in missing_params)
+    if isinstance(missing_params, str):
+        return bool(missing_params.strip())
+    return True
 
 
 def _pre_answer_budget_exhausted(state: dict, *, reflection_round: int) -> bool:
@@ -1922,6 +2030,21 @@ def _reflect(state: dict, *, stage: str) -> dict[str, Any]:
                 hints["next_query"] = question
             if not reasoning:
                 reasoning = "没有明确缺少用户私有必填信息，不应追问用户。"
+
+    if stage == "post_answer" and decision == "ask_user" and not has_user_required_clarification:
+        hints.pop("clarify_question", None)
+        hints.pop("missing_params", None)
+        if evidence:
+            decision = "revise_answer"
+            hints.setdefault(
+                "revise_instructions",
+                "上一版回答没有正确覆盖用户当前问题；请基于当前问题和已有证据重写，不要追问用户。",
+            )
+        else:
+            decision = "continue_retrieval"
+            hints.setdefault("next_query", question)
+        if not reasoning:
+            reasoning = "post-answer ask_user 没有用户私有必填信息，改为重写或继续检索。"
 
     # post-answer 若生成器已报错，不能 accept_answer。
     if stage == "post_answer" and (
@@ -2296,7 +2419,7 @@ def ask_user(state: dict) -> dict:
     request_id = state.get("request_id", "unknown")
     checkpoint_id: str | None = None
 
-    question = "请问您能提供更多信息吗？"
+    question = ""
     reflection_hints = state.get("reflection_hints", {})
     if isinstance(reflection_hints, dict):
         hinted_question = str(reflection_hints.get("clarify_question", "")).strip()
@@ -2315,22 +2438,39 @@ def ask_user(state: dict) -> dict:
         and _reflection_has_user_required_clarification(info_needs, reflection_hints)
     )
     if not has_required_question and not has_concrete_reflection_question:
-        question = (
-            "我不需要你补充版本或环境；我会先按默认 testnet、本地或云端自建 Fiber 节点、"
-            "小额热钱包、最小可行 agent 工具封装来推进。"
-        )
         guard_reason = "ask_user_without_required_info"
     else:
         guard_reason = ""
     if not guard_reason:
         question = _normalize_ask_user_question(question)
+    else:
+        locale = state.get("locale", "zh-CN")
+        user_prompt = prompts.DIRECT_ANSWER_USER.format(
+            question=_effective_question(state),
+            locale=locale,
+            conversation_context=_conversation_context_from_state(state),
+            time_budget=_time_budget_prompt(state),
+        )
+        profile = _select_model_profile(
+            state,
+            "composing",
+            node_name="direct_answer",
+            require_json=False,
+            fallback_tier="low",
+        )
+        question = _call_llm_with_retry(
+            prompts.DIRECT_ANSWER_SYSTEM,
+            user_prompt,
+            **_profile_kwargs(profile),
+            max_attempts=2,
+        ).strip()
 
     # 写入线程 checkpoint，支持用户补参后恢复。
     svc = state.get("_memory_service")
     context = _get_message_context(state)
     thread_key = _thread_key_from_context(context)
     origin_question = _effective_question(state)
-    if svc is not None and thread_key is not None:
+    if svc is not None and thread_key is not None and not guard_reason and question:
         try:
             checkpoint_id = svc.suspend_thread(
                 key=thread_key,
@@ -2356,6 +2496,7 @@ def ask_user(state: dict) -> dict:
     if guard_reason:
         response["need_user_input"] = False
         response["ask_user_guard_reason"] = guard_reason
+        response.pop("ask_user_question", None)
 
     logger.info(
         "ask_user request_id=%s question=%s checkpoint=%s",

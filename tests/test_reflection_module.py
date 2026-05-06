@@ -221,6 +221,53 @@ def test_reflection_post_compat_old_self_check_format():
     assert out["_self_check_pass"] is True
 
 
+def test_reflection_post_demotes_ask_user_without_required_info_to_revise():
+    state = _base_state(
+        info_needs=[
+            {
+                "kind": "latest_spec",
+                "question": "CKB 官方入门文档和社区推荐资料",
+                "required": False,
+            }
+        ],
+        evidence=[
+            {
+                "id": "ev1",
+                "source": "discourse",
+                "title": "CKB learning resources",
+                "url": "https://talk.nervos.org/t/example",
+                "anchor": "topic",
+                "snippet": "Community discussion about CKB resources.",
+                "score": 0.9,
+                "payload": {"source": "talk"},
+                "hash": "h1",
+                "retrieved_ts_ms": 1,
+            }
+        ],
+        _final_response={
+            "request_id": "r-ref-1",
+            "text": "我不需要你补充版本或环境。",
+            "citations": [],
+        },
+    )
+    with patch(
+        "nervos_brain.graph_engine.full_nodes.call_llm_json",
+        return_value={
+            "decision": "ask_user",
+            "reasoning": "官方资料属于公开可检索缺口，应继续检索而不是让用户确认。",
+            "uncertainty_score": 0.9,
+            "clarify_question": "请补充具体版本、运行环境或目标。",
+            "missing_params": ["version"],
+        },
+    ):
+        out = reflection_post(state)
+
+    assert out["reflection_decision"] == "revise_answer"
+    assert "clarify_question" not in out["reflection_hints"]
+    assert "missing_params" not in out["reflection_hints"]
+    assert "revise_instructions" in out["reflection_hints"]
+
+
 def test_reflection_pre_demote_ask_user_when_no_required_and_no_conflict():
     state = _base_state(
         evidence=[
@@ -415,7 +462,13 @@ def test_route_after_grading_invalid_ask_user_without_evidence_retrieves():
 def test_route_after_self_check_decision_mapping():
     assert route_after_self_check({"reflection_decision": "revise_answer"}) == "answer_composer"
     assert route_after_self_check({"reflection_decision": "continue_retrieval"}) == "retriever_planner"
-    assert route_after_self_check({"reflection_decision": "ask_user"}) == "ask_user"
+    assert route_after_self_check({"reflection_decision": "ask_user"}) == "retriever_planner"
+    assert route_after_self_check(
+        {
+            "reflection_decision": "ask_user",
+            "info_needs": [{"required": True, "question": "请贴完整报错日志"}],
+        }
+    ) == "ask_user"
     assert route_after_self_check({"reflection_decision": "accept_answer"}) == "format_repair"
 
 
@@ -430,46 +483,52 @@ def test_ask_user_normalizes_phrase_to_question():
     )
     text = out["_final_response"]["text"]
     assert "CKB框架的基本概念和介绍" in text
-    assert text.endswith("？")
+    assert text == "CKB框架的基本概念和介绍"
 
 
 def test_ask_user_does_not_wrap_generic_uncertainty_as_topic_question():
-    out = ask_user(
-        {
-            "request_id": "r-ask-generic",
-            "info_needs": [],
-            "reflection_hints": {
-                "clarify_question": "当前信息存在不确定性，请补充具体版本、环境或目标。"
-            },
-            "user_message": {"context": {"platform": "telegram", "user_id": "u-1"}},
-        }
-    )
+    with patch("nervos_brain.graph_engine.full_nodes.call_llm_json", side_effect=RuntimeError("router down")), \
+         patch("nervos_brain.graph_engine.full_nodes.call_llm", return_value="抱歉，我刚才可能答偏了。请把要继续回答的问题再发一次。"):
+        out = ask_user(
+            {
+                "request_id": "r-ask-generic",
+                "info_needs": [],
+                "reflection_hints": {
+                    "clarify_question": "当前信息存在不确定性，请补充具体版本、环境或目标。"
+                },
+                "user_message": {"content": "你是不是回复错问题了", "context": {"platform": "telegram", "user_id": "u-1"}},
+            }
+        )
     text = out["_final_response"]["text"]
     assert "你是想了解" not in text
     assert "当前信息存在不确定性" not in text
-    assert "默认 testnet" in text
+    assert "默认 testnet" not in text
+    assert text.startswith("抱歉")
     assert out["_final_response"]["need_user_input"] is False
 
 
 def test_ask_user_guard_avoids_generic_prompt_without_required_info():
-    out = ask_user(
-        {
-            "request_id": "r-ask-guard",
-            "info_needs": [
-                {
-                    "kind": "latest_spec",
-                    "question": "需要确认 Fiber 官方节点启动方式。",
-                    "required": False,
-                }
-            ],
-            "reflection_hints": {
-                "clarify_question": "请补充具体版本、运行环境或目标。"
-            },
-            "user_message": {"content": "我是萌新，你自己决定", "context": {"platform": "telegram", "user_id": "u-1"}},
-        }
-    )
+    with patch("nervos_brain.graph_engine.full_nodes.call_llm_json", side_effect=RuntimeError("router down")), \
+         patch("nervos_brain.graph_engine.full_nodes.call_llm", return_value="我会按你当前问题继续推进，不再让你补充版本或环境。"):
+        out = ask_user(
+            {
+                "request_id": "r-ask-guard",
+                "info_needs": [
+                    {
+                        "kind": "latest_spec",
+                        "question": "需要确认 Fiber 官方节点启动方式。",
+                        "required": False,
+                    }
+                ],
+                "reflection_hints": {
+                    "clarify_question": "请补充具体版本、运行环境或目标。"
+                },
+                "user_message": {"content": "我是萌新，你自己决定", "context": {"platform": "telegram", "user_id": "u-1"}},
+            }
+        )
     response = out["_final_response"]
     assert response["need_user_input"] is False
     assert response["ask_user_guard_reason"] == "ask_user_without_required_info"
-    assert "默认 testnet" in response["text"]
+    assert "默认 testnet" not in response["text"]
+    assert response["text"].startswith("我会按")
     assert out["_ask_user_guard_reason"] == "ask_user_without_required_info"

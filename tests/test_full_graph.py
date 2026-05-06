@@ -219,8 +219,8 @@ class TestDirectAnswerScenario:
 
         call_counter = {"info_gap": 0, "direct": 0, "planner": 0, "self_check": 0}
 
-        def mock_call_llm_json(system_prompt, user_prompt, *, model=None):
-            _ = user_prompt, model
+        def mock_call_llm_json(system_prompt, user_prompt, **_kwargs):
+            _ = user_prompt
             if "信息缺口评估" in system_prompt:
                 call_counter["info_gap"] += 1
                 return {
@@ -257,6 +257,37 @@ class TestDirectAnswerScenario:
         assert response.get("citations") == []
         assert "参考来源" not in response.get("text", "")
         assert result.get("_direct_answer") is True
+
+    def test_full_graph_correction_feedback_uses_direct_answer(self):
+        from nervos_brain.graph_engine.full_graph import build_full_graph
+
+        def mock_call_llm_json(system_prompt, user_prompt, **_kwargs):
+            _ = user_prompt
+            assert "模型档位路由器" in system_prompt
+            return {"tier": "low", "reasoning": "short correction feedback", "confidence": 0.9}
+
+        def mock_call_llm(system_prompt, user_prompt, **_kwargs):
+            assert "直接回答器" in system_prompt
+            assert "你是不是回复错问题了" in user_prompt
+            return "抱歉，刚才可能答偏了。请把你想继续问的问题再发一次，我会按当前问题重新回答。"
+
+        state = _make_state(
+            user_message={"content": "你是不是回复错问题了"},
+            recent_messages=[
+                {"role": "user", "content": "有没有比较靠谱的资料可以看？"},
+                {"role": "assistant", "content": "我不需要你补充版本或环境。"},
+            ],
+        )
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm", mock_call_llm), \
+             patch("nervos_brain.graph_engine.full_nodes.call_llm_json", mock_call_llm_json):
+            result = build_full_graph().invoke(state)
+
+        response = result.get("_final_response", {})
+        assert result.get("_direct_answer") is True
+        assert result.get("retrieval_policy") == "none"
+        assert response.get("text", "").startswith("抱歉")
+        assert not result.get("evidence")
 
     def test_direct_answer_can_use_recent_conversation_context(self):
         from nervos_brain.graph_engine.full_graph import build_full_graph
@@ -299,6 +330,192 @@ class TestDirectAnswerScenario:
 
 class TestSingleRetrievalScenario:
     """single policy 应最多做一轮轻量检索。"""
+
+    def test_retriever_planner_injects_source_registry_and_normalizes_source_alias(self):
+        from nervos_brain.graph_engine.full_nodes import retriever_planner
+
+        captured: dict[str, str] = {}
+
+        def mock_call_llm_json(system_prompt, user_prompt, **_kwargs):
+            _ = user_prompt
+            if "模型档位路由器" in system_prompt:
+                return {"tier": "low", "reasoning": "simple", "confidence": 0.9}
+            captured["planner_system_prompt"] = system_prompt
+            return {
+                "plan_id": "p-docs",
+                "rationale": "official docs",
+                "steps": [
+                    {
+                        "step_id": "step_1",
+                        "tool": "qdrant_search",
+                        "query": "CKB official tutorial beginner docs",
+                        "filters": {"source": "official_docs"},
+                        "top_k": 5,
+                    }
+                ],
+                "parallel_groups": [["step_1"]],
+                "budget": {"max_tool_calls": 1},
+            }
+
+        state = _make_state(
+            user_message={"content": "官方没有比较好的教程吗？"},
+            info_needs=[
+                {
+                    "kind": "latest_spec",
+                    "question": "CKB 官方新手教程和学习路径",
+                    "required": False,
+                }
+            ],
+            retrieval_policy="single",
+        )
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm_json", mock_call_llm_json):
+            out = retriever_planner(state)
+
+        prompt = captured["planner_system_prompt"]
+        assert "source=github_docs" in prompt
+        assert "source=nervos_talk" in prompt
+        assert "不要自造 official_docs" in prompt
+        step = out["retrieval_plan"]["steps"][0]
+        assert step["filters"] == {"source": "github_docs"}
+        assert "mapped_source:official_docs->github_docs" in step["filter_notes"]
+
+    def test_retrieval_executor_retries_empty_filtered_qdrant_without_filters(self):
+        from nervos_brain.graph_engine.full_nodes import retrieval_executor
+
+        class FakeRetriever:
+            def __init__(self) -> None:
+                self.calls: list[dict | None] = []
+
+            def search(self, query: str, filters=None, top_k: int = 5):
+                _ = query, top_k
+                self.calls.append(filters)
+                if filters:
+                    return []
+                return [
+                    {
+                        "id": "docs-getting-started",
+                        "source": "qdrant",
+                        "title": "CKB Getting Started",
+                        "url": "https://docs.nervos.org/",
+                        "anchor": "getting-started",
+                        "snippet": "Official CKB getting started guide.",
+                        "score": 0.9,
+                        "payload": {"source": "github_docs", "topic": "nervosnetwork/docs.nervos.org"},
+                        "hash": "h-docs",
+                        "retrieved_ts_ms": 1,
+                    }
+                ]
+
+        retriever = FakeRetriever()
+        state = _make_state(
+            request_id="test-source-fallback",
+            _multi_retriever=retriever,
+            retrieval_plan={
+                "plan_id": "p-docs",
+                "steps": [
+                    {
+                        "step_id": "step_1",
+                        "tool": "qdrant_search",
+                        "query": "CKB official tutorial beginner docs",
+                        "filters": {"source": "official_docs"},
+                        "top_k": 5,
+                    }
+                ],
+            },
+            budget={"max_tool_calls": 2, "max_evidence_chunks": 5},
+        )
+
+        out = retrieval_executor(state)
+
+        assert retriever.calls == [{"source": "github_docs"}, None]
+        assert out["evidence"][0]["payload"]["source"] == "github_docs"
+        assert out["_tool_calls_executed"] == 2
+        assert out["_tool_execution_trace"][0]["status"] == "empty"
+        assert "mapped_source:official_docs->github_docs" in out["_tool_execution_trace"][0]["filter_notes"]
+        assert out["_tool_execution_trace"][1]["fallback_reason"] == "empty_filtered_qdrant_search"
+
+    def test_nervos_brain_progress_uses_forum_evidence(self):
+        from nervos_brain.graph_engine.full_graph import build_full_graph
+
+        class FakeTransport:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            def send(self, payload: dict) -> dict:
+                self.calls.append(payload)
+                return {
+                    "evidence": [
+                        {
+                            "id": "talk-progress",
+                            "title": "Nervos Brain Week 4 Progress",
+                            "url": "https://talk.nervos.org/t/example",
+                            "anchor": "week-4",
+                            "snippet": "Nervos Brain has built the GitHub ingestion pipeline and RAG loop.",
+                            "score": 0.95,
+                            "payload": {"source": "talk"},
+                            "hash": "h1",
+                            "retrieved_ts_ms": 1,
+                        }
+                    ],
+                    "raw_size_bytes": 120,
+                    "redactions_applied": [],
+                }
+
+        def mock_call_llm_json(system_prompt, user_prompt, **_kwargs):
+            _ = user_prompt
+            if "模型档位路由器" in system_prompt:
+                return {"tier": "low", "reasoning": "simple", "confidence": 0.9}
+            if "信息缺口评估" in system_prompt:
+                return {
+                    "decision": "has_needs",
+                    "retrieval_policy": "single",
+                    "info_needs": [
+                        {
+                            "kind": "latest_spec",
+                            "question": "Nervos Brain 项目最新公开进度",
+                            "required": False,
+                        }
+                    ],
+                }
+            if "检索规划" in system_prompt:
+                return {
+                    "plan_id": "p-progress",
+                    "rationale": "Talk progress reports are the likely source",
+                    "steps": [
+                        {
+                            "step_id": "step_1",
+                            "tool": "discourse_query",
+                            "query": "Nervos Brain 目前进度 Spark Program 周报",
+                            "filters": {},
+                            "top_k": 5,
+                        }
+                    ],
+                    "parallel_groups": [["step_1"]],
+                    "budget": {"max_tool_calls": 1},
+                }
+            if "证据评分" in system_prompt or "自检" in system_prompt:
+                return {"decision": "accept_answer", "reasoning": "enough", "uncertainty_score": 0.1}
+            return {}
+
+        def mock_call_llm(system_prompt, user_prompt, **_kwargs):
+            assert "回答组装器" in system_prompt
+            assert "Nervos Brain" in user_prompt
+            return "Nervos Brain 目前处于早期工程化推进阶段，已打通数据入库和 RAG 闭环 [1]。"
+
+        transport = FakeTransport()
+        state = _make_state(
+            user_message={"content": "nervos brain 这个项目目前进度如何了"},
+            _tool_transport=transport,
+        )
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm", mock_call_llm), \
+             patch("nervos_brain.graph_engine.full_nodes.call_llm_json", mock_call_llm_json):
+            result = build_full_graph().invoke(state)
+
+        assert transport.calls[0]["tool"] == "discourse_query"
+        assert "Nervos Brain" in result["_final_response"]["text"]
+        assert result["evidence"][0]["source"] == "discourse"
 
     def test_single_retrieval_path_stops_after_one_hop(self):
         from nervos_brain.graph_engine.full_graph import build_full_graph
@@ -533,7 +750,13 @@ class TestRoutingFunctions:
 
     def test_route_after_assessment_ask_user(self):
         from nervos_brain.graph_engine.full_graph import route_after_assessment
-        assert route_after_assessment({"_route_decision": "ask_user"}) == "ask_user"
+        assert route_after_assessment({"_route_decision": "ask_user"}) == "answer_composer"
+        assert route_after_assessment(
+            {
+                "_route_decision": "ask_user",
+                "info_needs": [{"required": True, "question": "请贴完整报错日志"}],
+            }
+        ) == "ask_user"
 
     def test_route_after_assessment_has_needs(self):
         from nervos_brain.graph_engine.full_graph import route_after_assessment
@@ -855,6 +1078,27 @@ class TestInfoGapAssessorNode:
         assert out["retrieval_policy"] == "none"
         assert out["budget"]["max_tool_calls"] == 0
 
+    def test_response_quality_feedback_routes_to_direct_answer_without_retrieval(self):
+        from nervos_brain.graph_engine.full_nodes import info_gap_assessor
+
+        state = _make_state(
+            user_message={"content": "你是不是回复错问题了"},
+            recent_messages=[
+                {"role": "user", "content": "有没有比较靠谱的资料可以看？"},
+                {"role": "assistant", "content": "我不需要你补充版本或环境。"},
+            ],
+        )
+        with patch(
+            "nervos_brain.graph_engine.full_nodes.call_llm_json",
+            side_effect=AssertionError("feedback routing should not call LLM planner"),
+        ):
+            out = info_gap_assessor(state)
+
+        assert out["_route_decision"] == "answer_direct"
+        assert out["retrieval_policy"] == "none"
+        assert out["info_needs"] == []
+        assert out["budget"]["max_tool_calls"] == 0
+
     def test_answer_direct_is_coerced_to_has_needs_when_force_retrieval(self):
         from nervos_brain.graph_engine.full_nodes import info_gap_assessor
         state = _make_state(
@@ -906,6 +1150,40 @@ class TestInfoGapAssessorNode:
         assert out["budget"]["max_tool_calls"] == 2
         assert out["budget"]["max_reflection_rounds_pre"] == 1
 
+    def test_real_object_evaluation_can_use_single_retrieval(self):
+        from nervos_brain.graph_engine.full_nodes import info_gap_assessor
+
+        state = _make_state(
+            user_message={"content": "Nervos Brain 这个项目你觉得如何"},
+            budget={"max_tool_calls": 4, "max_hops": 3, "max_reflection_rounds_pre": 2},
+        )
+        mock_json_responses = {
+            "信息缺口评估": {
+                "decision": "has_needs",
+                "retrieval_policy": "single",
+                "info_needs": [
+                    {
+                        "kind": "historical_consensus",
+                        "question": "了解 Nervos Brain 的公开背景、计划和社区上下文后再评价",
+                        "required": False,
+                    }
+                ],
+                "reasoning": "评价真实项目需要外部上下文支撑，适合轻量检索。",
+            }
+        }
+        with patch(
+            "nervos_brain.graph_engine.full_nodes.call_llm_json",
+            _mock_call_llm_json_factory(mock_json_responses),
+        ):
+            out = info_gap_assessor(state)
+
+        assert out["_route_decision"] == "has_needs"
+        assert out["retrieval_policy"] == "single"
+        assert out["budget"]["max_hops"] == 1
+        assert out["budget"]["max_tool_calls"] == 2
+        assert out["budget"]["max_reflection_rounds_pre"] == 1
+        assert out["info_needs"][0]["required"] is False
+
     def test_has_needs_deep_policy_keeps_deeper_budget(self):
         from nervos_brain.graph_engine.full_nodes import info_gap_assessor
 
@@ -955,6 +1233,34 @@ class TestInfoGapAssessorNode:
         assert out["_route_decision"] == "ask_user"
         assert out["retrieval_policy"] == "none"
         assert out["info_needs"][0]["required"] is True
+
+    def test_info_gap_demotes_ask_user_without_required_info(self):
+        from nervos_brain.graph_engine.full_nodes import info_gap_assessor
+
+        state = _make_state(user_message={"content": "有没有比较靠谱的资料可以看？"})
+        mock_json_responses = {
+            "信息缺口评估": {
+                "decision": "ask_user",
+                "retrieval_policy": "none",
+                "info_needs": [
+                    {
+                        "kind": "latest_spec",
+                        "question": "CKB 官方入门文档和社区推荐学习资料",
+                        "required": False,
+                    }
+                ],
+                "reasoning": "公开资料缺口，不应追问用户。",
+            }
+        }
+        with patch(
+            "nervos_brain.graph_engine.full_nodes.call_llm_json",
+            _mock_call_llm_json_factory(mock_json_responses),
+        ):
+            out = info_gap_assessor(state)
+
+        assert out["_route_decision"] == "has_needs"
+        assert out["retrieval_policy"] == "single"
+        assert out["info_needs"][0]["required"] is False
 
 
 class TestFullGraphDebugState:
@@ -1013,9 +1319,14 @@ class TestPromptBoundaries:
         assert "只要能通过检索获得，就必须 required=false" in prompts.INFO_GAP_SYSTEM
         assert "如果你把公开可检索目标标成 required=true" in prompts.INFO_GAP_SYSTEM
         assert "具体项目、真实案例" in prompts.INFO_GAP_SYSTEM
+        assert "用户不必明说“查资料”" in prompts.INFO_GAP_SYSTEM
+        assert "当前模型上下文之外" in prompts.INFO_GAP_SYSTEM
+        assert "不要用关键词硬编码替代理解" in prompts.INFO_GAP_SYSTEM
+        assert "不要把这类问题只当作主观看法" in prompts.INFO_GAP_SYSTEM
         assert "不要向用户确认“你是不是想了解/检索 X”" in prompts.INFO_GAP_SYSTEM
         assert "这是授权你检索，不是让你追问确认" in prompts.INFO_GAP_SYSTEM
         assert "不要再追问" in prompts.INFO_GAP_SYSTEM
+        assert "答非所问" in prompts.INFO_GAP_SYSTEM
 
     def test_retriever_planner_prompt_prefers_minimal_search(self):
         from nervos_brain.graph_engine import prompts
@@ -1026,6 +1337,7 @@ class TestPromptBoundaries:
         assert "优先规划 discourse_query" in prompts.RETRIEVER_PLANNER_SYSTEM
         assert "这类问题不要只走 qdrant_search" in prompts.RETRIEVER_PLANNER_SYSTEM
         assert "不要写“请检索/需要检索/帮助用户理解”这种指令腔" in prompts.RETRIEVER_PLANNER_SYSTEM
+        assert "评价、判断或分析某个真实对象" in prompts.RETRIEVER_PLANNER_SYSTEM
 
     def test_reflection_prompt_avoids_vague_extra_loops(self):
         from nervos_brain.graph_engine import prompts
@@ -1041,6 +1353,7 @@ class TestPromptBoundaries:
         assert "公开资料版本冲突" in prompts.REFLECTION_SYSTEM
         assert "我是萌新/小白/你自己决定/按你推荐的来" in prompts.REFLECTION_SYSTEM
         assert "默认 testnet" in prompts.REFLECTION_SYSTEM
+        assert "不要用 ask_user 处理公开资料缺口" in prompts.REFLECTION_SYSTEM
         assert "超过目标耗时" in prompts.REFLECTION_SYSTEM
 
     def test_model_router_prompt_discourages_high_for_routine_reflection(self):

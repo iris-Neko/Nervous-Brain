@@ -29,6 +29,29 @@ from .rank_fusion import FusedResult, reciprocal_rank_fusion
 from .search import _build_filter_must
 
 
+def _is_broad_resource_query(query: str) -> bool:
+    text = str(query or "").lower()
+    compact = "".join(text.split())
+    markers = (
+        "资料",
+        "文档",
+        "教程",
+        "学习",
+        "入门",
+        "推荐",
+        "靠谱",
+        "可以看",
+        "resources",
+        "docs",
+        "documentation",
+        "tutorial",
+        "learning",
+        "recommended",
+        "getting started",
+    )
+    return any(marker in text or marker in compact for marker in markers)
+
+
 class MultiRetriever:
     """Orchestrate all retrieval paths and return fused Evidence.
 
@@ -86,19 +109,23 @@ class MultiRetriever:
         path_names: List[str] = []
 
         # ── 1. Vector search ───────────────────────────────────────────────
-        if filters:
-            vec_results = self._vector_search(query, filters, per_path_k)
+        # Broad official-doc queries should still hit the fast Qdrant path.
+        vec_results = self._vector_search(query, filters or {}, per_path_k)
+        if vec_results:
             ranked_lists.append(vec_results)
             path_names.append("vector")
 
+        run_slow_paths = not _is_broad_resource_query(query)
+
         # ── 2. BM25 keyword search ─────────────────────────────────────────
-        if cfg.enable_bm25 and self._bm25.size > 0:
+        if cfg.enable_bm25 and self._bm25.size > 0 and run_slow_paths:
             bm25_results = self._bm25_search(query, per_path_k, filters)
-            ranked_lists.append(bm25_results)
-            path_names.append("bm25")
+            if bm25_results:
+                ranked_lists.append(bm25_results)
+                path_names.append("bm25")
 
         # ── 3. Fuzzy match ─────────────────────────────────────────────────
-        if cfg.enable_fuzzy:
+        if cfg.enable_fuzzy and run_slow_paths:
             fuzzy_results = self._fuzzy_search(
                 query, per_path_k, cfg.fuzzy_threshold, filters
             )
@@ -107,7 +134,7 @@ class MultiRetriever:
                 path_names.append("fuzzy")
 
         # ── 4. Exact match ─────────────────────────────────────────────────
-        if cfg.enable_exact:
+        if cfg.enable_exact and run_slow_paths:
             exact_results = self._exact_search(query, per_path_k, filters)
             if exact_results:
                 ranked_lists.append(exact_results)
@@ -130,7 +157,7 @@ class MultiRetriever:
         self, query: str, filters: Dict[str, str], top_k: int
     ) -> List[dict]:
         query_vec = get_embedding(query, self._cfg)
-        query_filter = _build_filter_must(filters)
+        query_filter = _build_filter_must(filters) if filters else None
         try:
             response = self._qdrant.client.query_points(
                 collection_name=self._qdrant.config.collection_name,

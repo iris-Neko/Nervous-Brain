@@ -26,7 +26,7 @@ def build_tool_call_request(
     step_id: str,
     tool: str,
     args: dict[str, Any],
-    timeout_ms: int = 10_000,
+    timeout_ms: int = 60_000,
     allow_parallel: bool = True,
 ) -> ToolCallRequest:
     """构造合法的 ToolCallRequest，含自动校验。"""
