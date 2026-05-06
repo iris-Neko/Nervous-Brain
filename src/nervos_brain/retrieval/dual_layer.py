@@ -68,6 +68,7 @@ class ArchiveStore:
     def __init__(self, db_path: str | None = None, config: RetrievalConfig | None = None) -> None:
         cfg = config or load_retrieval_config()
         path = db_path or cfg.archive_db
+        self.db_path = str(path)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         engine = create_engine(f"sqlite:///{path}", echo=False)
         _Base.metadata.create_all(engine)

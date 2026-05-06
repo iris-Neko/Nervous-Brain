@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import time
 import re
 from typing import Any
@@ -184,6 +185,19 @@ def _search_archive_records(
 ) -> dict[str, Any]:
     if source == "discourse":
         category = _normalize_discourse_category(category)
+    query_variants = _expand_archive_queries(query, source=source)
+    sqlite_result = _search_archive_records_sql(
+        store=store,
+        source=source,
+        query_variants=query_variants,
+        top_k=max(1, min(int(top_k), 20)),
+        category=category,
+        repo=repo,
+        path=path,
+    )
+    if sqlite_result is not None:
+        return sqlite_result
+
     records = []
     for record in store.list_all():
         if source == "discourse" and record.source not in {"nervos_talk", "discourse"}:
@@ -201,7 +215,6 @@ def _search_archive_records(
     if not records:
         return {"evidence": [], "data": {"hit_count": 0}, "raw_size_bytes": 0, "redactions_applied": []}
 
-    query_variants = _expand_archive_queries(query, source=source)
     index = BM25Index()
     index.build(records)
     hits = _search_bm25_variants(
@@ -251,6 +264,258 @@ def _search_archive_records(
         "data": {"hit_count": len(evidence), "backend": "archive_bm25"},
         "raw_size_bytes": sum(len(row.get("snippet", "")) for row in evidence),
         "redactions_applied": [],
+    }
+
+
+def _search_archive_records_sql(
+    *,
+    store: ArchiveStore | CompositeArchiveStore,
+    source: str,
+    query_variants: list[str],
+    top_k: int,
+    category: str = "",
+    repo: str = "",
+    path: str = "",
+) -> dict[str, Any] | None:
+    db_paths = _archive_db_paths(store)
+    if not db_paths:
+        return None
+
+    terms = _archive_sql_terms(query_variants)
+    if not terms:
+        return None
+
+    rows: list[dict[str, Any]] = []
+    per_db_limit = max(50, top_k * 40)
+    for db_path in db_paths:
+        rows.extend(
+            _query_archive_db(
+                db_path=db_path,
+                source=source,
+                terms=terms,
+                category=category,
+                repo=repo,
+                path=path,
+                limit=per_db_limit,
+            )
+        )
+
+    ranked = _rank_archive_rows(rows, query_variants, terms, top_k)
+    evidence = [_archive_row_to_evidence(row, source=source, score=score) for score, row in ranked]
+    return {
+        "evidence": evidence,
+        "data": {"hit_count": len(evidence), "backend": "archive_sql_prefilter"},
+        "raw_size_bytes": sum(len(row.get("snippet", "")) for row in evidence),
+        "redactions_applied": [],
+    }
+
+
+def _archive_db_paths(store: ArchiveStore | CompositeArchiveStore) -> list[str]:
+    stores = store.stores if isinstance(store, CompositeArchiveStore) else [store]
+    paths: list[str] = []
+    seen: set[str] = set()
+    for item in stores:
+        db_path = str(getattr(item, "db_path", "") or "")
+        if db_path and db_path not in seen:
+            seen.add(db_path)
+            paths.append(db_path)
+    return paths
+
+
+def _archive_sql_terms(query_variants: list[str]) -> list[str]:
+    text = " ".join(str(item) for item in query_variants if str(item).strip())
+    lowered = text.lower()
+    terms: list[str] = []
+
+    def add(term: str) -> None:
+        cleaned = re.sub(r"\s+", " ", str(term or "").strip())
+        if cleaned and cleaned.lower() not in {item.lower() for item in terms}:
+            terms.append(cleaned)
+
+    for word in re.findall(r"[A-Za-z0-9_.+-]{2,}", text):
+        lower = word.lower()
+        if lower in {
+            "the",
+            "and",
+            "for",
+            "with",
+            "about",
+            "forum",
+            "talk",
+            "community",
+            "nervos",
+            "ckb",
+        }:
+            continue
+        add(word)
+        if lower.endswith("s") and len(lower) > 4:
+            add(word[:-1])
+
+    known_phrases = (
+        "Nervos Brain",
+        "Nervos.Land",
+        "prompt injection",
+        "开发进度",
+        "周报",
+        "真实数据",
+        "游戏",
+        "项目",
+        "讨论",
+        "社区",
+        "钱包",
+        "交易",
+        "转账",
+        "通道",
+        "节点",
+        "报错",
+        "错误",
+    )
+    for phrase in known_phrases:
+        if phrase.lower() in lowered or phrase in text:
+            add(phrase)
+
+    if "游戏" in text:
+        for term in ("game", "gaming", "GameFi", "Nervos.Land"):
+            add(term)
+    if "开发" in text or "进度" in text:
+        for term in ("开发进度", "周报", "progress"):
+            add(term)
+
+    return terms[:16]
+
+
+def _query_archive_db(
+    *,
+    db_path: str,
+    source: str,
+    terms: list[str],
+    category: str,
+    repo: str,
+    path: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    source_sql = "source in ('nervos_talk', 'discourse')" if source == "discourse" else "source like 'github%'"
+    fields = ("title", "summary", "keywords", "raw_text", "topic", "url", "anchor")
+    like_clauses: list[str] = []
+    where_params: list[Any] = []
+    score_clauses: list[str] = []
+    score_params: list[Any] = []
+    for term in terms:
+        title_weight = 6 if " " in term or any("\u4e00" <= ch <= "\u9fff" for ch in term) else 3
+        body_weight = 3 if " " in term or any("\u4e00" <= ch <= "\u9fff" for ch in term) else 1
+        for field, weight in (
+            ("title", title_weight),
+            ("keywords", title_weight),
+            ("summary", body_weight),
+            ("raw_text", body_weight),
+            ("topic", 2),
+            ("url", 1),
+            ("anchor", 1),
+        ):
+            score_clauses.append(f"case when {field} like ? then {weight} else 0 end")
+            score_params.append(f"%{term}%")
+        for field in fields:
+            like_clauses.append(f"{field} like ?")
+            where_params.append(f"%{term}%")
+
+    where = f"{source_sql} and (" + " or ".join(like_clauses) + ")"
+    score_sql = " + ".join(score_clauses) if score_clauses else "0"
+    params = [*score_params, *where_params, int(limit)]
+    sql = f"""
+        select id, source, doc_type, url, anchor, title, summary, keywords,
+               raw_text, raw_format, lang, version, topic, content_hash,
+               created_ts, updated_ts,
+               ({score_sql}) as match_score
+        from archive_records
+        where {where}
+        order by match_score desc, updated_ts desc, created_ts desc
+        limit ?
+    """
+
+    rows: list[dict[str, Any]] = []
+    with sqlite3.connect(db_path) as con:
+        con.row_factory = sqlite3.Row
+        for row in con.execute(sql, params):
+            item = dict(row)
+            if category and not _archive_row_matches(item, category):
+                continue
+            if repo and not _archive_row_matches(item, repo):
+                continue
+            if path and not _archive_row_matches(item, path):
+                continue
+            rows.append(item)
+    return rows
+
+
+def _archive_row_matches(row: dict[str, Any], needle: str) -> bool:
+    if not needle:
+        return True
+    needles = _expand_filter_needles(needle)
+    haystack = " ".join(
+        str(row.get(key, ""))
+        for key in ("title", "topic", "url", "keywords", "summary", "anchor")
+        if row.get(key)
+    ).lower()
+    return any(item and item in haystack for item in needles)
+
+
+def _rank_archive_rows(
+    rows: list[dict[str, Any]],
+    query_variants: list[str],
+    terms: list[str],
+    top_k: int,
+) -> list[tuple[float, dict[str, Any]]]:
+    by_anchor: dict[str, tuple[float, dict[str, Any]]] = {}
+    query_texts = [query.strip().lower() for query in query_variants if query.strip()]
+    lowered_terms = [term.lower() for term in terms if term.strip()]
+    for row in rows:
+        title = str(row.get("title", "") or "")
+        haystack = " ".join(
+            str(row.get(key, ""))
+            for key in ("title", "keywords", "summary", "raw_text", "topic", "url", "anchor")
+            if row.get(key)
+        ).lower()
+        title_lower = title.lower()
+        score = 0.0
+        for query_text in query_texts:
+            if query_text and query_text in haystack:
+                score += 8.0
+        for term in lowered_terms:
+            if term in title_lower:
+                score += 3.0
+            elif term in haystack:
+                score += 1.0
+        try:
+            score += min(float(row.get("updated_ts") or 0) / 1_000_000_000_000_000, 1.0)
+        except (TypeError, ValueError):
+            pass
+        if score <= 0:
+            continue
+        anchor = str(row.get("anchor", ""))
+        existing = by_anchor.get(anchor)
+        if existing is None or score > existing[0]:
+            by_anchor[anchor] = (score, row)
+    ranked = sorted(by_anchor.values(), key=lambda item: item[0], reverse=True)
+    return ranked[:top_k]
+
+
+def _archive_row_to_evidence(row: dict[str, Any], *, source: str, score: float) -> dict[str, Any]:
+    return {
+        "id": row.get("anchor", ""),
+        "source": source,
+        "title": row.get("title", ""),
+        "url": row.get("url", ""),
+        "anchor": row.get("anchor", ""),
+        "snippet": str(row.get("raw_text", "") or "")[:1200],
+        "score": float(score),
+        "payload": {
+            "source": row.get("source", ""),
+            "type": row.get("doc_type", ""),
+            "version": row.get("version", ""),
+            "topic": row.get("topic", ""),
+        },
+        "hash": row.get("content_hash", ""),
+        "retrieved_ts_ms": int(time.time() * 1000),
     }
 
 

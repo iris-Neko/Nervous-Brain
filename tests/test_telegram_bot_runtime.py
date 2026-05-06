@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from nervos_brain.tool_runtime.telegram_bot_runtime import (
+    TelegramBotAPI,
     TelegramBotConfig,
     TelegramBotRuntimeError,
     TelegramPollingGateway,
@@ -109,6 +110,32 @@ class _FakeAPI:
     ) -> None:
         _ = timeout_s
         self.chat_actions.append({"chat_id": chat_id, "action": action})
+
+
+class _FlakyTelegramAPI(TelegramBotAPI):
+    def __init__(self, *, fail_count: int) -> None:
+        super().__init__(TelegramBotConfig(bot_token="token"))
+        self.fail_count = fail_count
+        self.send_calls: list[dict[str, Any]] = []
+
+    def send_request(
+        self,
+        *,
+        method: str,
+        payload: dict[str, Any],
+        timeout_s: float = 30.0,
+    ) -> dict[str, Any]:
+        _ = timeout_s
+        self.send_calls.append({"method": method, "payload": dict(payload)})
+        if len(self.send_calls) <= self.fail_count:
+            raise TelegramBotRuntimeError("send failed")
+        return {"ok": True}
+
+
+class _AlwaysFailSendAPI(_FakeAPI):
+    def send_requests(self, requests_payloads: list[dict[str, Any]]) -> int:
+        self.sent_requests.extend(requests_payloads)
+        raise TelegramBotRuntimeError("send failed")
 
 
 class _FakeMemory:
@@ -696,6 +723,67 @@ def test_poll_once_advances_and_persists_offset(tmp_path: Path):
     assert len(rows) == 2
     assert gateway.next_offset == 203
     assert store.load() == 203
+
+
+def test_send_requests_retries_markdown_failure_as_plain_text():
+    api = _FlakyTelegramAPI(fail_count=1)
+    sent = api.send_requests(
+        [
+            {
+                "method": "sendMessage",
+                "payload": {
+                    "chat_id": -100123,
+                    "text": "*bad markdown",
+                    "parse_mode": "MarkdownV2",
+                    "reply_to_message_id": 5,
+                },
+            }
+        ]
+    )
+
+    assert sent == 1
+    assert len(api.send_calls) == 2
+    assert api.send_calls[0]["payload"]["parse_mode"] == "MarkdownV2"
+    assert "parse_mode" not in api.send_calls[1]["payload"]
+    assert api.send_calls[1]["payload"]["reply_to_message_id"] == 5
+
+
+def test_send_requests_retries_reply_failure_as_detached_plain_text():
+    api = _FlakyTelegramAPI(fail_count=2)
+    sent = api.send_requests(
+        [
+            {
+                "method": "sendMessage",
+                "payload": {
+                    "chat_id": -100123,
+                    "text": "*bad markdown",
+                    "parse_mode": "MarkdownV2",
+                    "reply_to_message_id": 5,
+                },
+            }
+        ]
+    )
+
+    assert sent == 1
+    assert len(api.send_calls) == 3
+    assert "parse_mode" not in api.send_calls[2]["payload"]
+    assert "reply_to_message_id" not in api.send_calls[2]["payload"]
+
+
+def test_poll_once_advances_offset_when_send_fails(tmp_path: Path):
+    fake_api = _AlwaysFailSendAPI([_sample_update(update_id=301, text="@NBCKB_Bot hello")])
+    store = TelegramUpdateOffsetStore(tmp_path / "tg_offset.txt")
+    gateway = TelegramPollingGateway(
+        api=fake_api,  # type: ignore[arg-type]
+        graph_runner=lambda state: {"_final_response": {"request_id": state["request_id"], "text": "ok"}},
+        offset_store=store,
+    )
+
+    rows = gateway.poll_once(dry_run=False, timeout_s=0, limit=10)
+
+    assert rows[0]["reason"] == "process_update_failed"
+    assert gateway.next_offset == 302
+    assert store.load() == 302
 
 
 def test_process_update_runner_error_returns_fallback_message():

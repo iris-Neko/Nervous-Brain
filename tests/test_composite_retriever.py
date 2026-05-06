@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import multiprocessing as mp
+import sqlite3
+import time
+from pathlib import Path
+from queue import Empty
+
 from nervos_brain.retrieval import (
     ArchiveRecord,
     ArchiveStore,
@@ -9,6 +15,10 @@ from nervos_brain.retrieval import (
     RetrievalConfig,
 )
 from nervos_brain.tool_runtime import build_tool_call_request, handle_discourse_query, handle_github_search
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_VERSIONED_FORUM_ARCHIVE = _REPO_ROOT / "data" / "forum_talk" / "archive.db"
 
 
 class _FakeRetriever:
@@ -68,6 +78,34 @@ def _record(
         topic=topic,
         content_hash=f"hash-{record_id}",
     )
+
+
+def _run_versioned_discourse_query(queue: mp.Queue, query: str) -> None:
+    try:
+        cfg = RetrievalConfig(archive_db=str(_VERSIONED_FORUM_ARCHIVE))
+        forum = ArchiveStore(db_path=cfg.archive_db, config=cfg)
+        req = build_tool_call_request(
+            request_id="r-versioned-forum",
+            step_id="s1",
+            tool="discourse_query",
+            args={
+                "query": query,
+                "category": "nervos talk",
+                "top_k": 3,
+                "_archive_store": CompositeArchiveStore([forum]),
+            },
+        )
+        started = time.perf_counter()
+        result = handle_discourse_query(req)
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        queue.put(
+            {
+                "elapsed_ms": elapsed_ms,
+                "anchors": [row["anchor"] for row in result.get("evidence", [])],
+            }
+        )
+    except Exception as exc:  # pragma: no cover - surfaced through child payload
+        queue.put({"error": f"{exc.__class__.__name__}: {exc}"})
 
 
 def test_composite_retriever_merges_backends_and_keeps_best_duplicate_score(tmp_path):
@@ -206,3 +244,109 @@ def test_discourse_fallback_expands_chinese_game_query(tmp_path):
 
     assert len(result["evidence"]) == 1
     assert result["evidence"][0]["anchor"] == "doc:forum-game-en"
+
+
+def test_discourse_fallback_retrieves_nervos_brain_progress_query(tmp_path):
+    forum_cfg = RetrievalConfig(archive_db=str(tmp_path / "forum.db"))
+    forum = ArchiveStore(db_path=forum_cfg.archive_db, config=forum_cfg)
+    forum.upsert(
+        _record(
+            record_id="forum-nervos-brain-progress",
+            source="nervos_talk",
+            anchor="doc:nervos-talk-9995#post:26",
+            title=(
+                "Spark Program | Nervos Brain - A Global Developer Onboarding "
+                "Engine and Cross-Language Hub Powered by Agentic RAG — reply #26"
+            ),
+            raw_text=(
+                "第四周周报：Nervos Brain 当前开发进度围绕真实数据接入、"
+                "真实模型回答、GitHub 多源文档抓取与入库、检索库规模化构建，"
+                "已经形成数据抓取到入库再到检索和回答的端到端示例。"
+            ),
+            topic="nervos_talk:9995",
+            url=(
+                "https://talk.nervos.org/t/spark-program-nervos-brain-a-global-"
+                "developer-onboarding-engine-and-cross-language-hub-powered-by-agentic-rag/9995/26"
+            ),
+        )
+    )
+
+    req = build_tool_call_request(
+        request_id="r-progress",
+        step_id="s1",
+        tool="discourse_query",
+        args={
+            "query": "Nervos Brain 目前开发进度怎么样了",
+            "category": "nervos talk",
+            "top_k": 3,
+            "_archive_store": CompositeArchiveStore([forum]),
+        },
+    )
+
+    result = handle_discourse_query(req)
+
+    assert len(result["evidence"]) == 1
+    assert result["evidence"][0]["anchor"] == "doc:nervos-talk-9995#post:26"
+    assert "真实数据接入" in result["evidence"][0]["snippet"]
+
+
+def test_versioned_forum_archive_contains_known_retrieval_fixtures():
+    assert _VERSIONED_FORUM_ARCHIVE.is_file()
+
+    with sqlite3.connect(_VERSIONED_FORUM_ARCHIVE) as con:
+        count = con.execute("select count(*) from archive_records").fetchone()[0]
+        nervos_brain_hits = con.execute(
+            """
+            select count(*)
+            from archive_records
+            where topic = 'nervos_talk:9995'
+              and (title like '%Nervos Brain%' or raw_text like '%Nervos Brain%')
+              and (raw_text like '%周报%' or raw_text like '%开发进度%')
+            """
+        ).fetchone()[0]
+        game_hits = con.execute(
+            """
+            select count(*)
+            from archive_records
+            where source = 'nervos_talk'
+              and (
+                raw_text like '%GameFi%'
+                or raw_text like '%Nervos.Land%'
+                or raw_text like '%game%'
+                or raw_text like '%游戏%'
+              )
+            """
+        ).fetchone()[0]
+
+    assert count > 0
+    assert nervos_brain_hits > 0
+    assert game_hits > 0
+
+
+def test_versioned_forum_discourse_query_returns_before_tool_timeout():
+    assert _VERSIONED_FORUM_ARCHIVE.is_file()
+
+    ctx = mp.get_context("fork")
+    queue = ctx.Queue()
+    proc = ctx.Process(
+        target=_run_versioned_discourse_query,
+        args=(queue, "Nervos Brain 目前开发进度怎么样了"),
+    )
+    proc.start()
+    proc.join(timeout=12)
+
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=2)
+        raise AssertionError(
+            "versioned forum discourse_query exceeded 12s; online tool timeout is 10s"
+        )
+
+    try:
+        payload = queue.get_nowait()
+    except Empty as exc:
+        raise AssertionError(f"versioned forum query process exited without result: {proc.exitcode}") from exc
+
+    assert "error" not in payload
+    assert payload["elapsed_ms"] < 10_000
+    assert any("doc:nervos-talk-9995#post" in anchor for anchor in payload["anchors"])

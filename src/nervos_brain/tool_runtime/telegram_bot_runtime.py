@@ -175,9 +175,36 @@ class TelegramBotAPI:
             payload = req.get("payload")
             if not isinstance(payload, dict):
                 raise TelegramBotRuntimeError("Invalid send request payload: expected object.")
-            self.send_request(method=method, payload=payload)
+            self._send_request_with_plain_fallback(method=method, payload=payload)
             sent += 1
         return sent
+
+    def _send_request_with_plain_fallback(
+        self,
+        *,
+        method: str,
+        payload: dict[str, Any],
+    ) -> Any:
+        try:
+            return self.send_request(method=method, payload=payload)
+        except TelegramBotRuntimeError as first_exc:
+            if method != "sendMessage":
+                raise
+            fallback_payload = dict(payload)
+            fallback_payload.pop("parse_mode", None)
+            if fallback_payload != payload:
+                try:
+                    logger.warning("Telegram sendMessage failed with parse_mode; retrying as plain text.")
+                    return self.send_request(method=method, payload=fallback_payload)
+                except TelegramBotRuntimeError:
+                    pass
+
+            detached_payload = dict(fallback_payload)
+            detached_payload.pop("reply_to_message_id", None)
+            if detached_payload != fallback_payload:
+                logger.warning("Telegram sendMessage failed as reply; retrying detached plain text.")
+                return self.send_request(method=method, payload=detached_payload)
+            raise first_exc
 
 
 @dataclass(frozen=True)
@@ -332,7 +359,26 @@ class TelegramPollingGateway:
             uid = _extract_update_id(update)
             if uid is not None:
                 max_seen = uid if max_seen is None else max(max_seen, uid)
-            rows.append(self.process_update(update, dry_run=dry_run))
+            try:
+                rows.append(self.process_update(update, dry_run=dry_run))
+            except Exception as exc:
+                logger.exception(
+                    "telegram process_update failed; advancing offset to avoid duplicate LLM calls "
+                    "update_id=%s error=%s",
+                    uid,
+                    exc,
+                )
+                rows.append(
+                    {
+                        "update_id": uid,
+                        "chat_id": _extract_chat_id_from_update(update),
+                        "ignored": False,
+                        "reason": "process_update_failed",
+                        "request_id": None,
+                        "sent_count": 0,
+                        "error": str(exc),
+                    }
+                )
 
         if max_seen is not None:
             self._next_offset = max_seen + 1
