@@ -77,6 +77,7 @@ class _FakeAPI:
         self.sent_requests: list[dict[str, Any]] = []
         self.callback_requests: list[dict[str, Any]] = []
         self.chat_actions: list[dict[str, Any]] = []
+        self.files: dict[str, tuple[str, bytes]] = {}
 
     def get_updates(
         self,
@@ -112,6 +113,17 @@ class _FakeAPI:
     ) -> None:
         _ = timeout_s
         self.chat_actions.append({"chat_id": chat_id, "action": action})
+
+    def get_file(self, file_id: str) -> dict[str, Any]:
+        file_path, _data = self.files[file_id]
+        return {"file_id": file_id, "file_path": file_path}
+
+    def download_file(self, file_path: str, *, timeout_s: float = 60.0) -> bytes:
+        _ = timeout_s
+        for known_path, data in self.files.values():
+            if known_path == file_path:
+                return data
+        raise KeyError(file_path)
 
 
 class _FlakyTelegramAPI(TelegramBotAPI):
@@ -454,6 +466,79 @@ def test_group_mention_processes_and_strips_mention():
     assert captured["user_message"]["content"] == "ckb是什么"
     assert fake_api.chat_actions == [{"chat_id": "-100123", "action": "typing"}]
     assert fake_api.sent_requests[-1]["payload"]["text"] == "ok"
+
+
+def test_process_update_downloads_text_document_into_user_message(tmp_path: Path):
+    fake_api = _FakeAPI()
+    fake_api.files["file_text_1"] = ("documents/notes.md", b"# CKB notes\nCell model basics")
+    captured: dict[str, Any] = {}
+
+    def runner(state: dict[str, Any]) -> dict[str, Any]:
+        captured.update(state)
+        return {"_final_response": {"request_id": state["request_id"], "text": "ok"}}
+
+    gateway = TelegramPollingGateway(
+        api=fake_api,  # type: ignore[arg-type]
+        graph_runner=runner,
+        bot_username="NBCKB_Bot",
+        attachment_download_dir=tmp_path,
+    )
+    update = _sample_update(text="@NBCKB_Bot 总结这个文件")
+    message = update["message"]
+    message.pop("text")
+    message["caption"] = "@NBCKB_Bot 总结这个文件"
+    message["document"] = {
+        "file_id": "file_text_1",
+        "file_unique_id": "uniq_text_1",
+        "file_name": "notes.md",
+        "mime_type": "text/markdown",
+        "file_size": 29,
+    }
+
+    row = gateway.process_update(update, dry_run=False)
+
+    assert row["ignored"] is False
+    content = captured["user_message"]["content"]
+    assert "总结这个文件" in content
+    assert "用户上传的文本文件 `notes.md` 内容" in content
+    assert "Cell model basics" in content
+    attachment = captured["user_message"]["attachments"][0]
+    assert attachment["status"] == "ready"
+    assert Path(attachment["local_path"]).is_file()
+
+
+def test_process_update_downloads_image_attachment_for_llm(tmp_path: Path):
+    fake_api = _FakeAPI()
+    fake_api.files["photo_1"] = ("photos/image.jpg", b"\xff\xd8\xff\xe0fakejpeg")
+    captured: dict[str, Any] = {}
+
+    def runner(state: dict[str, Any]) -> dict[str, Any]:
+        captured.update(state)
+        return {"_final_response": {"request_id": state["request_id"], "text": "ok"}}
+
+    gateway = TelegramPollingGateway(
+        api=fake_api,  # type: ignore[arg-type]
+        graph_runner=runner,
+        bot_username="NBCKB_Bot",
+        attachment_download_dir=tmp_path,
+    )
+    update = _sample_update(text="@NBCKB_Bot 看看这张图")
+    message = update["message"]
+    message.pop("text")
+    message["caption"] = "@NBCKB_Bot 看看这张图"
+    message["photo"] = [
+        {"file_id": "photo_small", "file_unique_id": "small", "file_size": 3},
+        {"file_id": "photo_1", "file_unique_id": "large", "file_size": 12},
+    ]
+
+    row = gateway.process_update(update, dry_run=False)
+
+    assert row["ignored"] is False
+    attachment = captured["user_message"]["attachments"][0]
+    assert attachment["kind"] == "image"
+    assert attachment["status"] == "ready"
+    assert Path(attachment["local_path"]).is_file()
+    assert "用户上传的图片已作为视觉输入传给模型" in captured["user_message"]["content"]
 
 
 def test_group_reply_to_bot_processes_without_mention():

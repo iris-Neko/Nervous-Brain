@@ -9,8 +9,10 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import mimetypes
 import os
 import time
 from pathlib import Path
@@ -101,6 +103,7 @@ def call_llm(
     reasoning_effort: str | None = None,
     verbosity: str | None = None,
     disable_response_storage: bool | None = None,
+    image_paths: list[str] | None = None,
 ) -> str:
     """统一调用 LLM，返回 assistant 内容字符串。"""
     global _last_call_meta
@@ -145,6 +148,7 @@ def call_llm(
                     reasoning_effort=effort,
                     verbosity=text_verbosity,
                     disable_store=disable_store,
+                    image_paths=image_paths,
                 ),
                 max_attempts=max_retries,
                 model_name=model_name,
@@ -155,7 +159,7 @@ def call_llm(
             "model": model_name,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": _chat_user_content(user_prompt, image_paths)},
             ],
             "max_tokens": tokens,
         }
@@ -195,6 +199,7 @@ def call_llm(
             "max_tokens": tokens,
             "elapsed_ms": elapsed_ms,
             "usage": usage,
+            "image_count": len(image_paths or []),
         }
 
 
@@ -282,6 +287,7 @@ def _call_llm_via_responses(
     reasoning_effort: str,
     verbosity: str,
     disable_store: bool,
+    image_paths: list[str] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     import litellm
 
@@ -289,7 +295,7 @@ def _call_llm_via_responses(
         "model": model_name,
         "input": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": _responses_user_content(user_prompt, image_paths)},
         ],
         "max_output_tokens": max_tokens,
     }
@@ -354,6 +360,44 @@ def _extract_responses_output_text(output: Any) -> str:
                 if isinstance(maybe_value, str) and maybe_value.strip():
                     chunks.append(maybe_value.strip())
     return "\n".join(chunks).strip()
+
+
+def _valid_image_data_urls(image_paths: list[str] | None) -> list[str]:
+    urls: list[str] = []
+    for raw_path in image_paths or []:
+        path = Path(str(raw_path))
+        if not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if not data or len(data) > 20 * 1024 * 1024:
+            continue
+        mime_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+        if not mime_type.startswith("image/"):
+            continue
+        encoded = base64.b64encode(data).decode("ascii")
+        urls.append(f"data:{mime_type};base64,{encoded}")
+    return urls[:4]
+
+
+def _responses_user_content(user_prompt: str, image_paths: list[str] | None) -> Any:
+    image_urls = _valid_image_data_urls(image_paths)
+    if not image_urls:
+        return user_prompt
+    content: list[dict[str, Any]] = [{"type": "input_text", "text": user_prompt}]
+    content.extend({"type": "input_image", "image_url": url} for url in image_urls)
+    return content
+
+
+def _chat_user_content(user_prompt: str, image_paths: list[str] | None) -> Any:
+    image_urls = _valid_image_data_urls(image_paths)
+    if not image_urls:
+        return user_prompt
+    content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
+    content.extend({"type": "image_url", "image_url": {"url": url}} for url in image_urls)
+    return content
 
 
 def _obj_to_dict(obj: Any) -> dict[str, Any]:
@@ -504,6 +548,7 @@ def call_llm_json(
     reasoning_effort: str | None = None,
     verbosity: str | None = None,
     max_tokens: int | None = None,
+    image_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     """调用 LLM 并解析 JSON 响应。"""
     json_hint_system = (
@@ -522,6 +567,7 @@ def call_llm_json(
         reasoning_effort=reasoning_effort,
         verbosity=verbosity,
         max_tokens=max_tokens,
+        image_paths=image_paths,
     )
     try:
         return json.loads(raw)
@@ -538,6 +584,7 @@ def call_llm_json(
             reasoning_effort=reasoning_effort,
             verbosity=verbosity,
             max_tokens=max_tokens,
+            image_paths=image_paths,
         )
         try:
             return json.loads(raw_retry)

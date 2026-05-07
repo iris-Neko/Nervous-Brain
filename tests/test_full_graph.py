@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -326,6 +327,45 @@ class TestDirectAnswerScenario:
         assert "CKB 是什么" in captured["info_gap_user_prompt"]
         assert "CKB 是什么" in captured["direct_user_prompt"]
         assert "CKB 是什么" in result["_final_response"]["text"]
+
+    def test_direct_answer_passes_image_paths_to_llm(self, tmp_path):
+        from nervos_brain.graph_engine.full_graph import build_full_graph
+
+        image_path = tmp_path / "screenshot.jpg"
+        image_path.write_bytes(b"\xff\xd8\xff\xe0fakejpeg")
+        captured: dict[str, Any] = {}
+
+        def mock_call_llm_json(system_prompt, user_prompt, **_kwargs):
+            _ = user_prompt
+            if "模型档位路由器" in system_prompt:
+                return {"tier": "low", "reasoning": "simple", "confidence": 0.9}
+            if "信息缺口评估" in system_prompt:
+                return {
+                    "decision": "answer_direct",
+                    "retrieval_policy": "none",
+                    "info_needs": [],
+                    "reasoning": "image question",
+                }
+            return {"decision": "accept_answer", "uncertainty_score": 0.1}
+
+        def mock_call_llm(system_prompt, user_prompt, **kwargs):
+            _ = system_prompt, user_prompt
+            captured["image_paths"] = kwargs.get("image_paths")
+            return "图里是 CKB 相关截图。"
+
+        state = _make_state(
+            user_message={
+                "content": "看看这张图",
+                "attachments": [{"kind": "image", "local_path": str(image_path), "name": "screenshot.jpg"}],
+            },
+        )
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm", mock_call_llm), \
+             patch("nervos_brain.graph_engine.full_nodes.call_llm_json", mock_call_llm_json):
+            result = build_full_graph().invoke(state)
+
+        assert captured["image_paths"] == [str(image_path)]
+        assert "CKB" in result["_final_response"]["text"]
 
 
 class TestSingleRetrievalScenario:

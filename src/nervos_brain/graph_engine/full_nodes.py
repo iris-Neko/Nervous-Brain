@@ -168,6 +168,25 @@ def _get_message_context(state: dict) -> dict[str, str]:
     return {k: str(v) for k, v in context.items() if v is not None}
 
 
+def _image_paths_from_state(state: dict) -> list[str]:
+    user_msg = state.get("user_message", {})
+    if not isinstance(user_msg, dict):
+        return []
+    attachments = user_msg.get("attachments", [])
+    if not isinstance(attachments, list):
+        return []
+    paths: list[str] = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        if str(attachment.get("kind", "") or "") != "image":
+            continue
+        local_path = str(attachment.get("local_path", "") or "").strip()
+        if local_path:
+            paths.append(local_path)
+    return paths[:4]
+
+
 def _merge_trace_summary(existing: str, extra: str) -> str:
     left = existing.strip()
     right = extra.strip()
@@ -1119,6 +1138,7 @@ def _call_llm_with_retry(
     verbosity: str | None = None,
     max_tokens: int | None = None,
     max_attempts: int = 2,
+    image_paths: list[str] | None = None,
 ) -> str:
     last_exc: Exception | None = None
     attempts = max(1, int(max_attempts))
@@ -1131,6 +1151,7 @@ def _call_llm_with_retry(
                 reasoning_effort=reasoning_effort,
                 verbosity=verbosity,
                 max_tokens=max_tokens,
+                image_paths=image_paths,
             )
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
@@ -2149,6 +2170,7 @@ def answer_composer(state: dict) -> dict:
         str(state.get("retrieval_policy", "")).strip() == "none"
         or str(state.get("_route_decision", "")).strip() == "answer_direct"
     )
+    image_paths = _image_paths_from_state(state)
 
     if not evidence:
         if direct_mode:
@@ -2172,6 +2194,7 @@ def answer_composer(state: dict) -> dict:
                     user_prompt,
                     **_profile_kwargs(profile),
                     max_attempts=2,
+                    image_paths=image_paths,
                 )
                 llm_trace_update = _llm_update_for_call(
                     state,
@@ -2265,6 +2288,7 @@ def answer_composer(state: dict) -> dict:
             user_prompt,
             **_profile_kwargs(profile),
             max_attempts=2,
+            image_paths=image_paths,
         )
         llm_trace_update = _llm_update_for_call(
             state,

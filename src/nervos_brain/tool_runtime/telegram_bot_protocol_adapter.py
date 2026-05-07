@@ -227,17 +227,26 @@ def _extract_attachments(msg: dict[str, Any]) -> list[dict[str, str]]:
                     "kind": "image",
                     "url": f"tgfile://{largest['file_id']}",
                     "name": str(largest.get("file_unique_id", "photo")),
+                    "file_id": str(largest["file_id"]),
+                    "file_unique_id": str(largest.get("file_unique_id", "")),
+                    "file_size": str(largest.get("file_size", "")),
                 }
             )
 
     for key in ("document", "video", "audio", "voice", "animation"):
         media = msg.get(key)
         if isinstance(media, dict) and media.get("file_id"):
+            mime_type = str(media.get("mime_type", "") or "")
+            kind = "image" if mime_type.startswith("image/") else "file"
             attachments.append(
                 {
-                    "kind": "file",
+                    "kind": kind,
                     "url": f"tgfile://{media['file_id']}",
                     "name": str(media.get("file_name") or media.get("file_unique_id") or key),
+                    "file_id": str(media["file_id"]),
+                    "file_unique_id": str(media.get("file_unique_id", "")),
+                    "mime_type": mime_type,
+                    "file_size": str(media.get("file_size", "")),
                 }
             )
 

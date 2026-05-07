@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import os
 import re
 import threading
@@ -33,6 +34,31 @@ from .telegram_bot_protocol_adapter import (
 from .feedback import FeedbackJsonlStore, parse_csat_callback_data
 
 logger = logging.getLogger(__name__)
+
+_TEXT_ATTACHMENT_EXTS = {
+    ".txt", ".md", ".markdown", ".json", ".jsonl", ".yaml", ".yml", ".toml",
+    ".csv", ".tsv", ".log", ".ini", ".cfg", ".conf", ".env", ".py", ".js",
+    ".jsx", ".ts", ".tsx", ".rs", ".go", ".java", ".c", ".h", ".cpp", ".hpp",
+    ".cs", ".rb", ".php", ".swift", ".kt", ".kts", ".scala", ".sh", ".bash",
+    ".zsh", ".fish", ".sql", ".html", ".css", ".xml", ".sol", ".move",
+}
+_TEXT_ATTACHMENT_MIME_PREFIXES = ("text/",)
+_TEXT_ATTACHMENT_MIME_TYPES = {
+    "application/json",
+    "application/jsonl",
+    "application/x-ndjson",
+    "application/yaml",
+    "application/x-yaml",
+    "application/toml",
+    "application/xml",
+    "application/javascript",
+    "application/typescript",
+    "application/x-sh",
+}
+_IMAGE_ATTACHMENT_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+_MAX_TEXT_ATTACHMENT_BYTES = 256 * 1024
+_MAX_TEXT_ATTACHMENT_CHARS = 16000
+_MAX_IMAGE_ATTACHMENT_BYTES = 20 * 1024 * 1024
 
 
 class TelegramBotRuntimeError(RuntimeError):
@@ -157,6 +183,23 @@ class TelegramBotAPI:
         timeout_s: float = 30.0,
     ) -> Any:
         return self.call(method=method, payload=payload, timeout_s=timeout_s)
+
+    def get_file(self, file_id: str) -> dict[str, Any]:
+        result = self.call("getFile", {"file_id": str(file_id)})
+        if isinstance(result, dict):
+            return result
+        raise TelegramBotRuntimeError("Telegram Bot API `getFile` returned invalid shape.")
+
+    def download_file(self, file_path: str, *, timeout_s: float = 60.0) -> bytes:
+        url = f"{self._cfg.api_base}/file/bot{self._cfg.bot_token}/{str(file_path).lstrip('/')}"
+        try:
+            with self._call_lock:
+                resp = self._session.get(url, timeout=timeout_s)
+                resp.raise_for_status()
+                return resp.content
+        except requests.RequestException as exc:
+            detail = _redact_telegram_error(str(exc), self._cfg.bot_token)
+            raise TelegramBotRuntimeError(f"Telegram file download failed: {detail}") from exc
 
     def send_chat_action(
         self,
@@ -312,6 +355,7 @@ class TelegramPollingGateway:
         target_elapsed_ms: int = 30000,
         max_elapsed_ms: int = 90000,
         max_worker_threads: int = 1,
+        attachment_download_dir: str | Path = "data/telegram_bot/attachments",
     ) -> None:
         self._api = api
         self._graph_runner = graph_runner
@@ -332,6 +376,7 @@ class TelegramPollingGateway:
         self._target_elapsed_ms = max(0, int(target_elapsed_ms or 0))
         self._max_elapsed_ms = max(0, int(max_elapsed_ms or 0))
         self._max_worker_threads = max(1, min(int(max_worker_threads or 1), 32))
+        self._attachment_download_dir = Path(attachment_download_dir).expanduser()
         self._debug_write_lock = threading.Lock()
         self._feedback_lock = threading.Lock()
 
@@ -531,6 +576,7 @@ class TelegramPollingGateway:
             budget.setdefault("max_elapsed_ms", self._max_elapsed_ms)
         state["render_mode"] = self._render_mode
         state["append_csat"] = self._append_csat
+        self._prepare_message_attachments(envelope=envelope, request_id=str(state.get("request_id", "unknown")))
         self._attach_recent_memory_context(state=state, envelope=envelope)
         self._write_memory_event(envelope=envelope, role="user", content=str(envelope.get("content", "") or ""))
         request_id = str(state.get("request_id", "unknown"))
@@ -620,6 +666,106 @@ class TelegramPollingGateway:
             "request_id": state.get("request_id"),
             "sent_count": sent_count if not dry_run else len(send_reqs),
         }
+
+    def _prepare_message_attachments(self, *, envelope: dict[str, Any], request_id: str) -> None:
+        attachments = envelope.get("attachments", [])
+        if not isinstance(attachments, list) or not attachments:
+            return
+
+        text_blocks: list[str] = []
+        image_names: list[str] = []
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            self._prepare_single_attachment(
+                attachment=attachment,
+                request_id=request_id,
+                text_blocks=text_blocks,
+                image_names=image_names,
+            )
+
+        content = str(envelope.get("content", "") or "").strip()
+        if not content and (text_blocks or image_names):
+            content = "请阅读我上传的文件或图片，并根据内容回答。"
+        if text_blocks:
+            content = (content + "\n\n" if content else "") + "\n\n".join(text_blocks)
+        if image_names:
+            image_note = "用户上传的图片已作为视觉输入传给模型：" + "、".join(image_names)
+            content = (content + "\n\n" if content else "") + image_note
+        envelope["content"] = content
+
+    def _prepare_single_attachment(
+        self,
+        *,
+        attachment: dict[str, Any],
+        request_id: str,
+        text_blocks: list[str],
+        image_names: list[str],
+    ) -> None:
+        file_id = _attachment_file_id(attachment)
+        if not file_id:
+            return
+
+        name = _safe_attachment_name(str(attachment.get("name", "") or "telegram_file"))
+        mime_type = str(attachment.get("mime_type", "") or mimetypes.guess_type(name)[0] or "")
+        is_image = _is_supported_image_attachment(attachment, name=name, mime_type=mime_type)
+        is_text = _is_supported_text_attachment(attachment, name=name, mime_type=mime_type)
+        if not is_image and not is_text:
+            attachment["status"] = "unsupported"
+            return
+
+        declared_size = _int_like(attachment.get("file_size", 0))
+        size_limit = _MAX_IMAGE_ATTACHMENT_BYTES if is_image else _MAX_TEXT_ATTACHMENT_BYTES
+        if declared_size > size_limit:
+            attachment["status"] = "too_large"
+            return
+
+        try:
+            meta = self._api.get_file(file_id)
+            file_path = str(meta.get("file_path", "") or "")
+            if not file_path:
+                attachment["status"] = "missing_file_path"
+                return
+            data = self._api.download_file(file_path)
+        except Exception as exc:
+            attachment["status"] = "download_failed"
+            attachment["error"] = str(exc)[:160]
+            logger.debug("telegram attachment download failed name=%s error=%s", name, exc)
+            return
+
+        if not data or len(data) > size_limit:
+            attachment["status"] = "too_large" if data else "empty"
+            return
+
+        suffix = Path(file_path).suffix or Path(name).suffix or (".jpg" if is_image else ".txt")
+        local_dir = self._attachment_download_dir / _safe_attachment_name(request_id)
+        try:
+            local_dir.mkdir(parents=True, exist_ok=True)
+            local_path = local_dir / f"{len(list(local_dir.iterdir())) + 1:02d}_{Path(name).stem[:48]}{suffix}"
+            local_path.write_bytes(data)
+        except OSError as exc:
+            attachment["status"] = "save_failed"
+            attachment["error"] = str(exc)[:160]
+            return
+
+        attachment["local_path"] = str(local_path)
+        attachment["mime_type"] = mime_type or mimetypes.guess_type(local_path.name)[0] or ""
+        attachment["file_size"] = str(len(data))
+        attachment["status"] = "ready"
+
+        if is_image:
+            attachment["kind"] = "image"
+            image_names.append(name)
+            return
+
+        decoded = _decode_text_attachment(data)
+        if decoded is None:
+            attachment["status"] = "decode_failed"
+            return
+        if len(decoded) > _MAX_TEXT_ATTACHMENT_CHARS:
+            decoded = decoded[:_MAX_TEXT_ATTACHMENT_CHARS].rstrip() + "\n...[文件内容已截断]"
+            attachment["truncated"] = "true"
+        text_blocks.append(f"用户上传的文本文件 `{name}` 内容：\n```text\n{decoded}\n```")
 
     def _attach_recent_memory_context(
         self,
@@ -1131,6 +1277,54 @@ def _optional_str(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _attachment_file_id(attachment: dict[str, Any]) -> str:
+    file_id = str(attachment.get("file_id", "") or "").strip()
+    if file_id:
+        return file_id
+    url = str(attachment.get("url", "") or "")
+    if url.startswith("tgfile://"):
+        return url.removeprefix("tgfile://").strip()
+    return ""
+
+
+def _safe_attachment_name(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip())
+    cleaned = cleaned.strip("._")
+    return cleaned[:96] or "telegram_file"
+
+
+def _is_supported_image_attachment(attachment: dict[str, Any], *, name: str, mime_type: str) -> bool:
+    suffix = Path(name).suffix.lower()
+    kind = str(attachment.get("kind", "") or "")
+    if mime_type.startswith("image/"):
+        return suffix != ".pdf"
+    return kind == "image" or suffix in _IMAGE_ATTACHMENT_EXTS
+
+
+def _is_supported_text_attachment(attachment: dict[str, Any], *, name: str, mime_type: str) -> bool:
+    if str(attachment.get("kind", "") or "") == "image":
+        return False
+    suffix = Path(name).suffix.lower()
+    if suffix == ".pdf":
+        return False
+    if suffix in _TEXT_ATTACHMENT_EXTS:
+        return True
+    if any(mime_type.startswith(prefix) for prefix in _TEXT_ATTACHMENT_MIME_PREFIXES):
+        return True
+    return mime_type in _TEXT_ATTACHMENT_MIME_TYPES
+
+
+def _decode_text_attachment(data: bytes) -> str | None:
+    for encoding in ("utf-8-sig", "utf-8", "gb18030", "latin-1"):
+        try:
+            text = data.decode(encoding)
+            text = text.replace("\x00", "")
+            return text.replace("```", "`\u200b``").strip()
+        except UnicodeDecodeError:
+            continue
+    return None
 
 
 def _format_recent_messages(rows: list[Any], limit_chars: int = 1800) -> str:
