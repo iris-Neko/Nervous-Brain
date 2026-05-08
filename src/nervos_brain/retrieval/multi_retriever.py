@@ -315,9 +315,27 @@ class MultiRetriever:
         archive_rec = self._archive.get_by_anchor(fused.anchor)
         snippet = ""
         url = "unknown"
+        payload = {
+            "rrf_score": str(fused.rrf_score),
+            **{f"contrib_{k}": str(v) for k, v in fused.contributions.items()},
+        }
         if archive_rec:
             snippet = archive_rec.raw_text[:1200]
             url = archive_rec.url
+            payload.update(
+                {
+                    "source": archive_rec.source,
+                    "type": archive_rec.doc_type,
+                    "doc_type": archive_rec.doc_type,
+                    "version": archive_rec.version,
+                    "lang": archive_rec.lang,
+                    "url": archive_rec.url,
+                    "anchor": archive_rec.anchor,
+                    "topic": archive_rec.topic,
+                    "title": archive_rec.title,
+                    "keywords": archive_rec.keywords,
+                }
+            )
 
         return {
             "id": fused.anchor,
@@ -327,10 +345,7 @@ class MultiRetriever:
             "anchor": fused.anchor,
             "snippet": snippet,
             "score": fused.rrf_score,
-            "payload": {
-                "rrf_score": str(fused.rrf_score),
-                **{f"contrib_{k}": str(v) for k, v in fused.contributions.items()},
-            },
+            "payload": payload,
             "hash": "",
             "retrieved_ts_ms": int(time.time() * 1000),
         }

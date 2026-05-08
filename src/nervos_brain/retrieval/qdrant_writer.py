@@ -1,12 +1,13 @@
 import hashlib
-from pathlib import Path
+import os
 from typing import Dict, List, Optional
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid5
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
 from .config import RetrievalConfig
+from nervos_brain.pathing import resolve_project_path
 
 
 def deterministic_embedding(text: str, dim: int = 64) -> List[float]:
@@ -31,8 +32,30 @@ class QdrantStore:
         qdrant_location: str = "data/qdrant_local",
     ) -> None:
         self.config = config or RetrievalConfig()
-        Path(qdrant_location).mkdir(parents=True, exist_ok=True)
-        self.client = QdrantClient(path=qdrant_location)
+        self.mode = "server" if self.config.qdrant_url else "local"
+        if self.config.qdrant_url:
+            api_key = None
+            if self.config.qdrant_api_key_env:
+                api_key = os.getenv(self.config.qdrant_api_key_env) or None
+            try:
+                self.client = QdrantClient(
+                    url=self.config.qdrant_url,
+                    api_key=api_key,
+                    timeout=self.config.qdrant_timeout_s,
+                    prefer_grpc=self.config.qdrant_prefer_grpc,
+                )
+                self.client.get_collections()
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to connect to Qdrant server "
+                    f"{self.config.qdrant_url!r}. Start it with "
+                    "`docker compose -f docker-compose.qdrant.yml up -d` "
+                    "or clear qdrant_url to use local path mode."
+                ) from exc
+        else:
+            resolved_location = resolve_project_path(qdrant_location)
+            resolved_location.mkdir(parents=True, exist_ok=True)
+            self.client = QdrantClient(path=str(resolved_location))
         self._ensure_collection()
 
     def _ensure_collection(self) -> None:
@@ -53,7 +76,7 @@ class QdrantStore:
             payload["snippet"] = text[: self.config.snippet_max_chars]
             points.append(
                 PointStruct(
-                    id=str(uuid4()),
+                    id=_stable_point_id(text, payload),
                     vector=deterministic_embedding(text, self.config.vector_size),
                     payload=payload,
                 )
@@ -61,3 +84,12 @@ class QdrantStore:
 
         self.client.upsert(collection_name=self.config.collection_name, points=points)
         return len(points)
+
+
+def _stable_point_id(text: str, payload: Dict[str, str]) -> str:
+    stable_key = str(
+        payload.get("hash")
+        or payload.get("anchor")
+        or hashlib.sha256(text.encode("utf-8")).hexdigest()
+    )
+    return str(uuid5(NAMESPACE_URL, stable_key))

@@ -31,6 +31,7 @@ from nervos_brain.retrieval import (
     reciprocal_rank_fusion,
     tokenize,
 )
+from nervos_brain.retrieval.qdrant_writer import _stable_point_id
 
 
 # ── shared fixtures ─────────────────────────────────────────────────────────
@@ -124,6 +125,44 @@ def test_load_retrieval_config_has_rrf_k():
 def test_retrieval_config_overrides_apply(cfg):
     assert cfg.vector_size == 64
     assert cfg.fuzzy_threshold == 0.4
+
+
+def test_qdrant_stable_point_id_prefers_hash_then_anchor():
+    assert _stable_point_id("text", {"hash": "h1", "anchor": "a1"}) == _stable_point_id(
+        "other text",
+        {"hash": "h1", "anchor": "a2"},
+    )
+    assert _stable_point_id("text", {"anchor": "a1"}) == _stable_point_id(
+        "other text",
+        {"anchor": "a1"},
+    )
+    assert _stable_point_id("text", {}) == _stable_point_id("text", {})
+
+
+def test_qdrant_store_uses_server_url_when_configured(monkeypatch):
+    calls: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            calls["kwargs"] = kwargs
+
+        def get_collections(self):
+            class Collections:
+                collections = []
+
+            return Collections()
+
+        def create_collection(self, **kwargs):
+            calls["create_collection"] = kwargs
+
+    monkeypatch.setattr("nervos_brain.retrieval.qdrant_writer.QdrantClient", FakeClient)
+    cfg = RetrievalConfig(qdrant_url="http://127.0.0.1:6333", collection_name="test")
+
+    store = QdrantStore(config=cfg)
+
+    assert store.mode == "server"
+    assert calls["kwargs"]["url"] == "http://127.0.0.1:6333"
+    assert calls["create_collection"]["collection_name"] == "test"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -617,3 +656,13 @@ def test_retriever_rrf_provenance_in_payload(populated_retriever):
     for e in results:
         # payload must carry at least the rrf_score key
         assert "rrf_score" in e["payload"]
+
+
+def test_retriever_hydrated_payload_keeps_archive_metadata(populated_retriever):
+    results = populated_retriever.search("open channel capacity", filters={"source": "fiber"})
+    hit = next(e for e in results if e["anchor"] == "doc:open-channel#chunk:0")
+
+    assert hit["payload"]["source"] == "fiber"
+    assert hit["payload"]["type"] == "doc"
+    assert hit["payload"]["topic"] == "unknown"
+    assert hit["payload"]["url"] == "https://example.com/open-channel"

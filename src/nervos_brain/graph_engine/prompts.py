@@ -89,7 +89,7 @@ RETRIEVER_PLANNER_SYSTEM = """\
       "step_id": "step_1",
       "tool": "qdrant_search" | "discourse_query" | "github_search" | "memory_fetch",
       "query": "搜索查询语句",
-      "filters": {"source": "rfcs"},
+      "filters": {"source": "github_docs"},
       "top_k": 5
     }
   ],
@@ -104,9 +104,9 @@ RETRIEVER_PLANNER_SYSTEM = """\
 - 如果信息需求是评价、判断或分析某个真实对象，query 应保留对象名，并选择最可能提供背景、事实和社区上下文的资料源。
 
 工具选择：
-- qdrant_search：优先用于官方文档、RFC、SDK 文档、概念解释、API、代码示例、仓库内容、协议规范。
+- qdrant_search：优先用于官方文档、RFC、SDK 文档、概念解释、API、仓库说明、协议规范；需要指定来源时用 source registry 的精确 source。
 - discourse_query：优先用于 Nervos Talk / 论坛 / 社区讨论 / 生态项目 / grant / proposal / 具体案例 / 项目列表 / 谁在用 / “有没有可以看看”的材料。
-- github_search：优先用于仓库路径、README、源码、配置、命令、代码片段、SDK 示例。
+- github_search：优先用于仓库路径、源码、配置、命令、函数/类/模块、代码片段、SDK 示例；源码类问题可以写 filters.source=github_code，或者用 repo/path 缩小范围。
 - memory_fetch：只用于用户历史偏好、同一用户同一群的短期偏好或已确认背景；不要用它替代公共资料检索。
 - 如果要写 filters.source，必须使用运行时注入的 source registry 中的精确 source 值；不要自造 source 名称。
 
@@ -114,6 +114,10 @@ RETRIEVER_PLANNER_SYSTEM = """\
 - 如果用户要具体项目、真实案例、生态应用、GameFi、NFT、Spore、RGB++、grant、proposal、Talk、论坛、链接、可以看看，优先规划 discourse_query。
 - 这类问题不要只走 qdrant_search；如果 retrieval_policy="single"，首选 1 个 discourse_query，query 可写成“CKB Nervos 游戏 GameFi 项目案例 Talk”这类自然关键词。
 - 如果用户既要“官方怎么做”又要“具体项目”，可以在 single 下规划 discourse_query + qdrant_search 两步；deep 下再加 github_search。
+
+源码与实现问题:
+- 如果用户问函数、类、模块、配置、命令实现、SDK 示例代码、报错对应源码或“代码在哪里”，优先规划 github_search；query 保留函数名/文件名/错误信息。
+- 如果用 qdrant_search 检索源码库，filters.source 必须写 github_code；官方文档、README、RFC 仍使用 github_docs。
 
 预算与质量：
 - 默认只做 1 个高质量 query；只有 retrieval_policy="deep" 或问题明确需要多来源交叉验证时，才规划多步骤。

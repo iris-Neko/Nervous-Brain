@@ -3,6 +3,7 @@
 Current sources:
   discourse  — Nervos Talk (Discourse-based forum)
   github     — GitHub repository docs crawler
+  github_code — GitHub repository source-code crawler
   jsonl      — generic local JSONL source
 """
 
@@ -16,6 +17,7 @@ from .discourse_parallel import (
     build_crawl_key,
 )
 from .github_docs import GitHubDocsCrawler, GitHubRepo
+from .github_code import GitHubCodeCrawler
 from .html_cleaner import html_to_text, make_summary
 from .jsonl_crawler import JsonlCrawler
 from .pipeline import IngestStats, IngestionPipeline
@@ -32,6 +34,7 @@ __all__ = [
     "TopicCrawlResult",
     "build_crawl_key",
     "GitHubDocsCrawler",
+    "GitHubCodeCrawler",
     "GitHubRepo",
     "JsonlCrawler",
     "IngestStats",

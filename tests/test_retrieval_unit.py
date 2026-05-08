@@ -63,6 +63,9 @@ def test_config_defaults():
     cfg = RetrievalConfig()
     assert cfg.vector_size == 64
     assert cfg.collection_name == "nervos_docs"
+    assert cfg.qdrant_url == ""
+    assert cfg.qdrant_api_key_env == "QDRANT_API_KEY"
+    assert cfg.qdrant_prefer_grpc is False
 
 
 def test_load_retrieval_config_supports_section_inheritance(monkeypatch):
@@ -72,6 +75,8 @@ def test_load_retrieval_config_supports_section_inheritance(monkeypatch):
         {
             "retrieval": {
                 "qdrant_path": "data/qdrant_main",
+                "qdrant_url": "http://127.0.0.1:6333",
+                "qdrant_timeout_s": 12,
                 "collection_name": "main_docs",
                 "vector_size": 64,
             },
@@ -85,6 +90,8 @@ def test_load_retrieval_config_supports_section_inheritance(monkeypatch):
 
     cfg = load_retrieval_config(section="retrieval_forum_talk", inherit_from="retrieval")
     assert cfg.qdrant_path == "data/qdrant_main"
+    assert cfg.qdrant_url == "http://127.0.0.1:6333"
+    assert cfg.qdrant_timeout_s == 12
     assert cfg.archive_db == "data/forum_talk/archive.db"
     assert cfg.collection_name == "forum_docs"
 
@@ -116,7 +123,7 @@ def test_load_retrieval_backend_configs_uses_configured_sections(monkeypatch):
         retrieval_config_module,
         "_config_cache",
         {
-            "retrieval_backends": ["retrieval", "retrieval_forum_talk"],
+            "retrieval_backends": ["retrieval", "retrieval_forum_talk", "retrieval_github_code"],
             "retrieval": {
                 "qdrant_path": "data/qdrant_local",
                 "collection_name": "nervos_docs",
@@ -129,14 +136,27 @@ def test_load_retrieval_backend_configs_uses_configured_sections(monkeypatch):
                 "collection_name": "nervos_talk_user_discussions",
                 "archive_db": "data/forum_talk/archive.db",
             },
+            "retrieval_github_code": {
+                "qdrant_path": "data/qdrant_github_code",
+                "collection_name": "nervos_github_code",
+                "archive_db": "data/github_code/archive.db",
+            },
         },
         raising=False,
     )
 
     configs = load_retrieval_backend_configs()
-    assert [name for name, _ in configs] == ["retrieval", "retrieval_forum_talk"]
+    assert [name for name, _ in configs] == [
+        "retrieval",
+        "retrieval_forum_talk",
+        "retrieval_github_code",
+    ]
     assert configs[0][1].archive_db == "data/archive.db"
     assert configs[1][1].archive_db == "data/forum_talk/archive.db"
     assert configs[1][1].qdrant_path == "data/qdrant_talk_forum"
     assert configs[1][1].collection_name == "nervos_talk_user_discussions"
     assert configs[1][1].final_top_k == 7
+    assert configs[2][1].archive_db == "data/github_code/archive.db"
+    assert configs[2][1].qdrant_path == "data/qdrant_github_code"
+    assert configs[2][1].collection_name == "nervos_github_code"
+    assert configs[2][1].final_top_k == 7

@@ -1,11 +1,13 @@
 .pytest_cache/
 .DS_Store
 .codex
+.agent/
 docs/
 report/
 
 # Local secrets and machine-specific runtime config
 config.yaml
+config.yml
 .env
 .env.*
 *.key
@@ -27,6 +29,10 @@ data/discord_bot/
 data/product_demo/
 data/tmp/
 data/tmp*.db
+data/github_code/
+data/qdrant_github_code/
+data/qdrant_server/
+data/sources/github_code.jsonl
 
 # Temporary/debug vector stores
 *.lock

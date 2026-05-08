@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
+
+from nervos_brain.pathing import load_project_config, resolve_project_path
 
 _config_cache: dict[str, Any] | None = None
 
@@ -12,19 +13,7 @@ def _load_yaml_config() -> dict[str, Any]:
     if _config_cache is not None:
         return _config_cache
 
-    module_path = Path(__file__).resolve()
-    candidates = [Path.cwd() / "config.yaml"]
-    candidates.extend(parent / "config.yaml" for parent in module_path.parents)
-    yaml_path = next((path for path in candidates if path.is_file()), None)
-
-    if yaml_path is not None:
-        import yaml
-
-        with open(yaml_path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
-        _config_cache = raw if isinstance(raw, dict) else {}
-    else:
-        _config_cache = {}
+    _config_cache = load_project_config()
     return _config_cache
 
 
@@ -38,6 +27,23 @@ def get_retrieval_section(section: str) -> dict[str, Any]:
 def has_retrieval_section(section: str) -> bool:
     """Whether config.yaml contains a mapping section with this name."""
     return bool(get_retrieval_section(section))
+
+
+def _bool_cfg(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _float_cfg(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def get_retrieval_backend_sections(default_section: str = "retrieval") -> list[str]:
@@ -83,6 +89,10 @@ class RetrievalConfig:
     vector_size: int = 64
     collection_name: str = "nervos_docs"
     qdrant_path: str = "data/qdrant_local"
+    qdrant_url: str = ""
+    qdrant_api_key_env: str = "QDRANT_API_KEY"
+    qdrant_timeout_s: float = 10.0
+    qdrant_prefer_grpc: bool = False
 
     # 切片参数
     chunk_size: int = 600
@@ -127,19 +137,23 @@ def load_retrieval_config(
         vector_size=int(cfg.get("vector_size", 64)),
         collection_name=cfg.get("collection_name", "nervos_docs"),
         qdrant_path=cfg.get("qdrant_path", "data/qdrant_local"),
+        qdrant_url=str(cfg.get("qdrant_url", "") or "").strip(),
+        qdrant_api_key_env=str(cfg.get("qdrant_api_key_env", "QDRANT_API_KEY") or "").strip(),
+        qdrant_timeout_s=_float_cfg(cfg.get("qdrant_timeout_s", 10.0), 10.0),
+        qdrant_prefer_grpc=_bool_cfg(cfg.get("qdrant_prefer_grpc", False), False),
         chunk_size=int(cfg.get("chunk_size", 600)),
         chunk_overlap=int(cfg.get("chunk_overlap", 120)),
         snippet_max_chars=int(cfg.get("snippet_max_chars", 1200)),
         archive_db=cfg.get("archive_db", "data/archive.db"),
-        use_real_embedding=bool(cfg.get("use_real_embedding", False)),
+        use_real_embedding=_bool_cfg(cfg.get("use_real_embedding", False), False),
         embedding_model=cfg.get("embedding_model", "openai/embedding-2"),
         top_k_per_path=int(cfg.get("top_k_per_path", 10)),
         final_top_k=int(cfg.get("final_top_k", 10)),
         rrf_k=int(cfg.get("rrf_k", 60)),
         fuzzy_threshold=float(cfg.get("fuzzy_threshold", 0.55)),
-        enable_bm25=bool(cfg.get("enable_bm25", True)),
-        enable_fuzzy=bool(cfg.get("enable_fuzzy", True)),
-        enable_exact=bool(cfg.get("enable_exact", True)),
+        enable_bm25=_bool_cfg(cfg.get("enable_bm25", True), True),
+        enable_fuzzy=_bool_cfg(cfg.get("enable_fuzzy", True), True),
+        enable_exact=_bool_cfg(cfg.get("enable_exact", True), True),
     )
 
 

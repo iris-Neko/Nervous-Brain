@@ -1,5 +1,5 @@
 param(
-    [string]$EnvName = "nervous-brain",
+    [string]$EnvName = "nervos-brain",
     [string]$ScriptPath = "scripts/run_telegram_bot_polling.py",
     [switch]$Debug,
     [switch]$DryRun,

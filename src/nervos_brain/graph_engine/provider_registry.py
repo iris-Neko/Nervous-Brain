@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 from typing import Literal
+
+from nervos_brain.pathing import load_project_config
 
 
 TaskType = Literal[
@@ -101,27 +102,8 @@ _DEFAULT_PROFILES: dict[str, ModelProfile] = {
 }
 
 
-def _load_project_config() -> dict[str, Any]:
-    candidates = [
-        Path.cwd() / "config.yaml",
-        Path(__file__).resolve().parents[3] / "config.yaml",
-    ]
-    for path in candidates:
-        if not path.is_file():
-            continue
-        try:
-            import yaml
-
-            with open(path, "r", encoding="utf-8") as f:
-                raw = yaml.safe_load(f) or {}
-            return raw if isinstance(raw, dict) else {}
-        except Exception:
-            return {}
-    return {}
-
-
 def _load_profiles_from_config() -> dict[str, ModelProfile]:
-    raw = _load_project_config().get("llm_profiles", {})
+    raw = load_project_config().get("llm_profiles", {})
     if not isinstance(raw, dict):
         return dict(_DEFAULT_PROFILES)
 

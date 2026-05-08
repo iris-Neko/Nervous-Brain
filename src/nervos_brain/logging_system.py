@@ -15,6 +15,8 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+from nervos_brain.pathing import ensure_parent_dir, load_project_config, resolve_project_path
 from threading import Lock
 from typing import Any, Iterator
 
@@ -64,25 +66,11 @@ class JsonLogFormatter(logging.Formatter):
 
 
 def _load_project_logging_cfg() -> dict[str, Any]:
-    candidates = [
-        Path.cwd() / "config.yaml",
-        Path(__file__).resolve().parents[2] / "config.yaml",
-    ]
-    for path in candidates:
-        if not path.is_file():
-            continue
-        try:
-            import yaml
-
-            with open(path, "r", encoding="utf-8") as f:
-                raw = yaml.safe_load(f) or {}
-            if not isinstance(raw, dict):
-                return {}
-            section = raw.get("logging", {})
-            return dict(section) if isinstance(section, dict) else {}
-        except Exception:
-            return {}
-    return {}
+    try:
+        section = load_project_config().get("logging", {})
+        return dict(section) if isinstance(section, dict) else {}
+    except Exception:
+        return {}
 
 
 def _to_level(value: str | int | None, default: int = logging.INFO) -> int:
@@ -134,7 +122,7 @@ def setup_logging(
         )
 
         dir_value = log_dir if log_dir is not None else cfg.get("log_dir", "data/logs")
-        log_dir_path = Path(dir_value).expanduser().resolve()
+        log_dir_path = resolve_project_path(dir_value)
         max_bytes = int(cfg.get("max_bytes", 10 * 1024 * 1024))
         backup_count = int(cfg.get("backup_count", 5))
 
@@ -164,7 +152,7 @@ def setup_logging(
 
         log_path = None
         if effective_file:
-            log_dir_path.mkdir(parents=True, exist_ok=True)
+            ensure_parent_dir(log_dir_path / ".keep")
             log_path = log_dir_path / f"{service_name}.log"
             file_handler = RotatingFileHandler(
                 log_path,

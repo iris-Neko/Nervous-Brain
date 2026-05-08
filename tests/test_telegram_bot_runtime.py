@@ -10,6 +10,8 @@ from typing import Any
 
 import pytest
 
+from nervos_brain.pathing import project_root
+
 from nervos_brain.tool_runtime.telegram_bot_runtime import (
     TelegramBotAPI,
     TelegramBotConfig,
@@ -1176,3 +1178,29 @@ def test_feedback_command_records_comment(tmp_path: Path):
     assert comments[0]["comment"] == "citation missing"
     assert comments[0]["trace_summary"] == "tools=s1:github_search=ok:1"
     assert fake_api.sent_requests[-1]["payload"]["text"] == "Feedback recorded for tg-req-1."
+
+
+def test_telegram_runner_config_loads_when_cwd_differs(monkeypatch, tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("telegram_bot:\n  memory_db: data/telegram_bot/memory.db\n", encoding="utf-8")
+    monkeypatch.setenv("NERVOS_BRAIN_CONFIG", str(cfg_path))
+    from nervos_brain import pathing
+    pathing.config_path.cache_clear()
+    pathing.load_project_config.cache_clear()
+    runner = _load_script_module("run_telegram_bot_pathing_config", "run_telegram_bot_polling.py")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+
+    cfg = runner._load_telegram_bot_cfg()
+
+    assert cfg["memory_db"] == "data/telegram_bot/memory.db"
+
+
+def test_telegram_runner_resolves_runtime_paths_to_project_root(monkeypatch, tmp_path):
+    runner = _load_script_module("run_telegram_bot_pathing_runtime", "run_telegram_bot_polling.py")
+    monkeypatch.chdir(tmp_path)
+
+    resolved = runner.resolve_project_path("data/telegram_bot/memory.db")
+
+    assert resolved == project_root() / "data" / "telegram_bot" / "memory.db"

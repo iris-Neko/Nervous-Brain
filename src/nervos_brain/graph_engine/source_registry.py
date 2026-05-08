@@ -22,8 +22,8 @@ SOURCES: dict[str, RetrievalSource] = {
         tool_hint="qdrant_search",
         description=(
             "官方文档、docs.nervos.org、RFC、CKB/CCC/Fiber 仓库 README、SDK 文档、"
-            "示例项目和仓库内说明。用户问官方教程、入门路径、协议规范、SDK/API、"
-            "命令或代码示例时优先使用。"
+            "教程、协议规范和仓库内说明。用户问官方教程、入门路径、概念解释、"
+            "规范或文档链接时优先使用。"
         ),
         topic_examples=(
             "nervosnetwork/docs.nervos.org",
@@ -32,6 +32,23 @@ SOURCES: dict[str, RetrievalSource] = {
             "ckb-devrel/ccc",
             "nervosnetwork/fiber",
             "nervosnetwork/fiber-docs",
+        ),
+    ),
+    "github_code": RetrievalSource(
+        id="github_code",
+        label="GitHub source code, config files, and executable examples",
+        tool_hint="github_search",
+        description=(
+            "Nervos 相关 GitHub 仓库源码、配置、脚本、函数、类型、模块、测试、"
+            "SDK 示例代码和可执行调用方式。用户问源码位置、函数/类/命令实现、"
+            "配置项、调用链、报错对应代码或具体代码片段时优先使用。"
+        ),
+        topic_examples=(
+            "nervosnetwork/ckb",
+            "nervosnetwork/fiber",
+            "ckb-devrel/ccc",
+            "RGBPlusPlus/rgbpp",
+            "appfi5/appfi5",
         ),
     ),
     "nervos_talk": RetrievalSource(
@@ -56,6 +73,12 @@ SOURCE_ALIASES: dict[str, str] = {
     "github": "github_docs",
     "github_doc": "github_docs",
     "github_docs": "github_docs",
+    "code": "github_code",
+    "source_code": "github_code",
+    "github_code": "github_code",
+    "github-source": "github_code",
+    "github_source": "github_code",
+    "repo_code": "github_code",
     "rfcs": "github_docs",
     "rfc": "github_docs",
     "talk": "nervos_talk",
@@ -93,7 +116,7 @@ def format_source_registry_for_prompt() -> str:
         "qdrant_search.filters 支持字段：source、topic、type/doc_type、version、lang、url、anchor、title、keywords。"
     )
     lines.append(
-        "官方教程/官方文档/入门资料应使用 source=github_docs；社区讨论/项目案例优先使用 discourse_query。"
+        "官方教程/官方文档/入门资料应使用 source=github_docs；源码/函数/配置/代码片段应使用 source=github_code 或 github_search；社区讨论/项目案例优先使用 discourse_query。"
     )
     return "\n".join(lines)
 

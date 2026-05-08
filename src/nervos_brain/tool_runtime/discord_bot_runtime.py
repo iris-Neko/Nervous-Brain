@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -203,9 +205,17 @@ class DiscordGateway:
 class DiscordBotRuntime:
     """Online Discord runtime backed by discord.py event loop."""
 
-    def __init__(self, *, config: DiscordBotConfig, gateway: DiscordGateway) -> None:
+    def __init__(
+        self,
+        *,
+        config: DiscordBotConfig,
+        gateway: DiscordGateway,
+        max_worker_threads: int = 4,
+    ) -> None:
         self._config = config
         self._gateway = gateway
+        self._max_worker_threads = max(1, min(int(max_worker_threads or 1), 32))
+        self._channel_locks: dict[str, asyncio.Lock] = {}
 
     def run(self) -> None:
         try:
@@ -235,7 +245,15 @@ class DiscordBotRuntime:
                 return
 
             payload = _discord_message_to_payload(message)
-            row = self._gateway.process_message_payload(payload, bot_user_id=str(client.user.id))
+            channel_id = str(payload.get("channel_id") or "unknown")
+            lock = self._channel_locks.setdefault(channel_id, asyncio.Lock())
+            async with lock:
+                row = await _run_gateway_in_executor(
+                    gateway=self._gateway,
+                    payload=payload,
+                    bot_user_id=str(client.user.id),
+                    executor=executor,
+                )
             if row.get("ignored"):
                 logger.info(
                     "[skip] message_id=%s channel_id=%s guild_id=%s reason=%s",
@@ -257,7 +275,28 @@ class DiscordBotRuntime:
                 sent,
             )
 
-        client.run(self._config.bot_token)
+        executor = ThreadPoolExecutor(
+            max_workers=self._max_worker_threads,
+            thread_name_prefix="discord-graph-worker",
+        )
+        try:
+            client.run(self._config.bot_token)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+
+async def _run_gateway_in_executor(
+    *,
+    gateway: DiscordGateway,
+    payload: dict[str, Any],
+    bot_user_id: str,
+    executor: ThreadPoolExecutor,
+) -> dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        executor,
+        lambda: gateway.process_message_payload(payload, bot_user_id=bot_user_id),
+    )
 
 
 def _is_bot_mentioned(content: str, bot_user_id: str, payload: dict[str, Any]) -> bool:

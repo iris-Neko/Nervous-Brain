@@ -35,6 +35,7 @@ from nervos_brain.memory import (  # noqa: E402
     init_memory_schema,
 )
 from nervos_brain.logging_system import setup_logging  # noqa: E402
+from nervos_brain.pathing import load_project_config, resolve_project_path  # noqa: E402
 from nervos_brain.retrieval import (  # noqa: E402
     build_configured_retriever,
 )
@@ -85,25 +86,12 @@ class _FixedModelRegistry:
 
 
 def _load_telegram_bot_cfg() -> dict[str, Any]:
-    candidates = [
-        Path.cwd() / "config.yaml",
-        Path(__file__).resolve().parents[1] / "config.yaml",
-    ]
-    for path in candidates:
-        if not path.is_file():
-            continue
-        try:
-            import yaml
-
-            with open(path, "r", encoding="utf-8") as f:
-                raw = yaml.safe_load(f) or {}
-            section = raw.get("telegram_bot", {})
-            if isinstance(section, dict):
-                return section
-            return {}
-        except Exception:
-            return {}
-    return {}
+    try:
+        section = load_project_config().get("telegram_bot", {})
+        return dict(section) if isinstance(section, dict) else {}
+    except Exception:
+        logger.exception("Failed to load telegram_bot config")
+        return {}
 
 
 def _cfg_int(cfg: dict[str, Any], key: str, default: int) -> int:
@@ -354,7 +342,7 @@ def main() -> int:
     model = args.model.strip()
     runtime, memory_service = _build_runtime(
         model=model,
-        memory_db=Path(args.memory_db).expanduser().resolve(),
+        memory_db=resolve_project_path(args.memory_db),
     )
     graph = build_full_graph()
 
@@ -370,10 +358,10 @@ def main() -> int:
         setup_info.get("log_file", ""),
     )
 
-    offset_store = TelegramUpdateOffsetStore(Path(args.offset_file).expanduser().resolve())
+    offset_store = TelegramUpdateOffsetStore(resolve_project_path(args.offset_file))
     allowed_chat_ids = _parse_allowed_chat_ids(args.allowed_chat_id)
-    feedback_file = Path(args.feedback_file).expanduser().resolve()
-    debug_log_file = Path(args.debug_log_file).expanduser().resolve() if str(args.debug_log_file).strip() else None
+    feedback_file = resolve_project_path(args.feedback_file)
+    debug_log_file = resolve_project_path(args.debug_log_file) if str(args.debug_log_file).strip() else None
     gateway = TelegramPollingGateway(
         api=api,
         graph_runner=lambda state: invoke_full_graph(

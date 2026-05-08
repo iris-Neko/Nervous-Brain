@@ -414,11 +414,54 @@ class TestSingleRetrievalScenario:
 
         prompt = captured["planner_system_prompt"]
         assert "source=github_docs" in prompt
+        assert "source=github_code" in prompt
         assert "source=nervos_talk" in prompt
         assert "不要自造 official_docs" in prompt
         step = out["retrieval_plan"]["steps"][0]
         assert step["filters"] == {"source": "github_docs"}
         assert "mapped_source:official_docs->github_docs" in step["filter_notes"]
+
+    def test_retriever_planner_normalizes_code_source_alias(self):
+        from nervos_brain.graph_engine.full_nodes import retriever_planner
+
+        def mock_call_llm_json(system_prompt: str, user_prompt: str, **_kwargs):
+            _ = system_prompt, user_prompt
+            if "模型档位路由器" in system_prompt:
+                return {"tier": "low", "reasoning": "simple", "confidence": 0.9}
+            return {
+                "plan_id": "plan_code",
+                "rationale": "source code lookup",
+                "steps": [
+                    {
+                        "step_id": "step_1",
+                        "tool": "qdrant_search",
+                        "query": "fiber open_channel source code",
+                        "filters": {"source": "code", "topic": "nervosnetwork/fiber"},
+                        "top_k": 5,
+                    }
+                ],
+                "parallel_groups": [["step_1"]],
+                "budget": {"max_tool_calls": 1},
+            }
+
+        state = _make_state(
+            user_message={"content": "Fiber open_channel 的源码在哪里？"},
+            info_needs=[
+                {
+                    "kind": "latest_spec",
+                    "question": "Fiber open_channel 源码",
+                    "required": False,
+                }
+            ],
+            retrieval_policy="single",
+        )
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm_json", mock_call_llm_json):
+            out = retriever_planner(state)
+
+        step = out["retrieval_plan"]["steps"][0]
+        assert step["filters"] == {"source": "github_code", "topic": "nervosnetwork/fiber"}
+        assert "mapped_source:code->github_code" in step["filter_notes"]
 
     def test_retrieval_executor_retries_empty_filtered_qdrant_without_filters(self):
         from nervos_brain.graph_engine.full_nodes import retrieval_executor

@@ -26,6 +26,7 @@ from nervos_brain.memory import (  # noqa: E402
     init_memory_schema,
 )
 from nervos_brain.logging_system import setup_logging  # noqa: E402
+from nervos_brain.pathing import load_project_config, resolve_project_path  # noqa: E402
 from nervos_brain.retrieval import (  # noqa: E402
     build_configured_retriever,
 )
@@ -74,24 +75,11 @@ class _FixedModelRegistry:
 
 
 def _load_project_cfg() -> dict[str, Any]:
-    candidates = [
-        Path.cwd() / "config.yaml",
-        Path(__file__).resolve().parents[1] / "config.yaml",
-    ]
-    for path in candidates:
-        if not path.is_file():
-            continue
-        try:
-            import yaml
-
-            with open(path, "r", encoding="utf-8") as f:
-                raw = yaml.safe_load(f) or {}
-            if isinstance(raw, dict):
-                return raw
-            return {}
-        except Exception:
-            return {}
-    return {}
+    try:
+        return load_project_config()
+    except Exception:
+        logger.exception("Failed to load project config")
+        return {}
 
 
 def _load_discord_bot_cfg(project_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -148,6 +136,13 @@ def _cfg_bool(cfg: dict[str, Any], key: str, default: bool) -> bool:
     return raw not in {"0", "false", "no"}
 
 
+def _cfg_int(cfg: dict[str, Any], key: str, default: int) -> int:
+    try:
+        return int(cfg.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
 def main() -> int:
     project_cfg = _load_project_cfg()
     bot_cfg = _load_discord_bot_cfg(project_cfg)
@@ -193,6 +188,12 @@ def main() -> int:
         help="Whether to append CSAT marker in outbound messages.",
     )
     parser.add_argument(
+        "--max-worker-threads",
+        type=int,
+        default=_cfg_int(bot_cfg, "max_worker_threads", 4),
+        help="Concurrent Discord graph worker threads; same channel messages stay ordered.",
+    )
+    parser.add_argument(
         "--mention-only-in-guild",
         action="store_true",
         default=_cfg_bool(bot_cfg, "mention_only_in_guild", True),
@@ -232,7 +233,7 @@ def main() -> int:
     )
     runtime = _build_runtime(
         model=model,
-        memory_db=Path(args.memory_db).expanduser().resolve(),
+        memory_db=resolve_project_path(args.memory_db),
     )
     graph = build_full_graph()
 
@@ -254,6 +255,7 @@ def main() -> int:
             mention_only_in_guild=bool(args.mention_only_in_guild),
         ),
         gateway=gateway,
+        max_worker_threads=max(1, int(args.max_worker_threads)),
     )
     bot_runtime.run()
     return 0

@@ -20,6 +20,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 
 from .anchor_hash import build_stable_hash
 from .config import RetrievalConfig, load_retrieval_config
+from nervos_brain.pathing import resolve_project_path
 from .embedding import get_embedding
 from .qdrant_writer import QdrantStore
 
@@ -67,9 +68,9 @@ class ArchiveStore:
 
     def __init__(self, db_path: str | None = None, config: RetrievalConfig | None = None) -> None:
         cfg = config or load_retrieval_config()
-        path = db_path or cfg.archive_db
+        path = resolve_project_path(db_path or cfg.archive_db)
         self.db_path = str(path)
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         engine = create_engine(f"sqlite:///{path}", echo=False)
         _Base.metadata.create_all(engine)
         # expire_on_commit=False keeps attributes readable after the session

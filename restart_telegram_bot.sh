@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-ENV_NAME="${ENV_NAME:-nervous-brain}"
+ENV_NAME="${ENV_NAME:-nervos-brain}"
 SCRIPT_PATH="${SCRIPT_PATH:-scripts/run_telegram_bot_polling.py}"
 MAMBA_BIN="${MAMBA_BIN:-${MICROMAMBA_BIN:-mamba}}"
 LOG_DIR="${LOG_DIR:-data/logs}"

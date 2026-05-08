@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from nervos_brain.pathing import load_project_config
+
 _config_cache: dict[str, Any] | None = None
 _logger = logging.getLogger(__name__)
 _last_call_meta: dict[str, Any] | None = None
@@ -41,26 +43,17 @@ _TRANSIENT_ERROR_MARKERS = (
 
 
 def _load_config() -> dict[str, Any]:
-    """从 config.yaml 加载配置，缓存结果。"""
+    """从 config.yaml 的 llm 段加载配置，缓存结果。"""
     global _config_cache
     if _config_cache is not None:
         return _config_cache
 
-    _config_cache = {}
-    candidates = [
-        Path.cwd() / "config.yaml",
-        Path(__file__).resolve().parents[3] / "config.yaml",  # src/nervos_brain/graph_engine -> 项目根
-    ]
-    for path in candidates:
-        if path.is_file():
-            try:
-                import yaml
-                with open(path, "r", encoding="utf-8") as f:
-                    data = yaml.safe_load(f) or {}
-                _config_cache = data.get("llm", {})
-            except Exception:
-                pass
-            break
+    try:
+        data = load_project_config().get("llm", {})
+        _config_cache = dict(data) if isinstance(data, dict) else {}
+    except Exception:
+        _logger.exception("Failed to load llm config")
+        _config_cache = {}
     return _config_cache
 
 

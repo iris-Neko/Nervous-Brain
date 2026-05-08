@@ -7,8 +7,11 @@ from typing import Any
 
 import pytest
 
+from nervos_brain.pathing import project_root
+
 from nervos_brain.tool_runtime.discord_bot_runtime import (
     DiscordBotConfig,
+    DiscordBotRuntime,
     DiscordBotRuntimeError,
     DiscordGateway,
 )
@@ -58,6 +61,17 @@ def test_discord_bot_config_from_env_parses_mention_flag(monkeypatch):
     cfg = DiscordBotConfig.from_env()
     assert cfg.bot_token == "abc"
     assert cfg.mention_only_in_guild is False
+
+
+def test_discord_bot_runtime_clamps_worker_count():
+    gateway = DiscordGateway(graph_runner=lambda state: {})
+    runtime = DiscordBotRuntime(
+        config=DiscordBotConfig(bot_token="token"),
+        gateway=gateway,
+        max_worker_threads=999,
+    )
+
+    assert runtime._max_worker_threads == 32
 
 
 def test_gateway_ignores_bot_sender():
@@ -196,3 +210,29 @@ def test_build_runtime_model_argument_forces_fixed_registry(monkeypatch, tmp_pat
     profile = runtime.provider_registry.get_profile_for("reflection", tier="low")
     assert profile["model"] == "openai/gpt-5.5"
     assert profile["reasoning_effort"] == ""
+
+
+def test_discord_runner_config_loads_when_cwd_differs(monkeypatch, tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("discord_bot:\n  memory_db: data/discord_bot/memory.db\n", encoding="utf-8")
+    monkeypatch.setenv("NERVOS_BRAIN_CONFIG", str(cfg_path))
+    from nervos_brain import pathing
+    pathing.config_path.cache_clear()
+    pathing.load_project_config.cache_clear()
+    runner = _load_script_module("run_discord_bot_pathing_config", "run_discord_bot.py")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+
+    cfg = runner._load_project_cfg()
+
+    assert cfg["discord_bot"]["memory_db"] == "data/discord_bot/memory.db"
+
+
+def test_discord_runner_resolves_runtime_paths_to_project_root(monkeypatch, tmp_path):
+    runner = _load_script_module("run_discord_bot_pathing_runtime", "run_discord_bot.py")
+    monkeypatch.chdir(tmp_path)
+
+    resolved = runner.resolve_project_path("data/discord_bot/memory.db")
+
+    assert resolved == project_root() / "data" / "discord_bot" / "memory.db"

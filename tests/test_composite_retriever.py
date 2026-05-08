@@ -213,6 +213,47 @@ def test_composite_archive_store_feeds_discourse_and_github_fallback(tmp_path):
     assert [row["anchor"] for row in gh_result["evidence"]] == ["doc:github-ccc"]
 
 
+def test_github_search_fallback_includes_github_code_archive(tmp_path):
+    code_cfg = RetrievalConfig(archive_db=str(tmp_path / "code.db"))
+    code = ArchiveStore(db_path=code_cfg.archive_db, config=code_cfg)
+    code.upsert(
+        ArchiveRecord(
+            id="code-1",
+            source="github_code",
+            doc_type="github_code",
+            url="https://github.com/nervosnetwork/fiber/blob/main/src/channel.rs",
+            anchor="code:github-fiber-channel",
+            title="nervosnetwork/fiber/src/channel.rs",
+            summary="pub fn open_channel",
+            keywords="github,code,nervosnetwork,fiber,open_channel,Channel",
+            raw_text="pub struct Channel {}\npub fn open_channel() {}\n",
+            raw_format="code",
+            lang="rust",
+            version="abc123",
+            topic="nervosnetwork/fiber",
+            content_hash="hash-code-1",
+        )
+    )
+
+    req = build_tool_call_request(
+        request_id="r-code",
+        step_id="s1",
+        tool="github_search",
+        args={
+            "query": "open_channel Channel",
+            "repo": "nervosnetwork/fiber",
+            "top_k": 3,
+            "_archive_store": CompositeArchiveStore([code]),
+        },
+    )
+
+    result = handle_github_search(req)
+
+    assert [row["anchor"] for row in result["evidence"]] == ["code:github-fiber-channel"]
+    assert result["evidence"][0]["payload"]["source"] == "github_code"
+    assert result["evidence"][0]["payload"]["type"] == "github_code"
+
+
 def test_discourse_fallback_expands_chinese_game_query(tmp_path):
     forum_cfg = RetrievalConfig(archive_db=str(tmp_path / "forum.db"))
     forum = ArchiveStore(db_path=forum_cfg.archive_db, config=forum_cfg)
