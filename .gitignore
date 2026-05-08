@@ -29,13 +29,11 @@ data/discord_bot/
 data/product_demo/
 data/tmp/
 data/tmp*.db
-data/github_code/
-data/qdrant_github_code/
 data/qdrant_server/
-data/sources/github_code.jsonl
 
 # Temporary/debug vector stores
 *.lock
+data/qdrant_github_code/.lock
 data/qdrant_local_tmp_debug*/
 
 # Keep crawler/runtime data that is intentionally versioned:
