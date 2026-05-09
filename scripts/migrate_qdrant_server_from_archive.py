@@ -19,6 +19,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from nervos_brain.retrieval import ArchiveStore, RetrievalConfig, deterministic_embedding
 from nervos_brain.retrieval.config import load_retrieval_backend_configs
+from nervos_brain.pathing import resolve_project_path
+
+
+PUBLIC_BACKEND_OVERRIDES = {
+    "retrieval": {
+        "qdrant_path": "data/qdrant_local",
+        "collection_name": "nervos_docs",
+        "archive_db": "data/archive.db",
+    },
+    "retrieval_forum_talk": {
+        "qdrant_path": "data/qdrant_talk_forum",
+        "collection_name": "nervos_talk_user_discussions",
+        "archive_db": "data/forum_talk/archive.db",
+    },
+    "retrieval_github_code": {
+        "qdrant_path": "data/qdrant_github_code",
+        "collection_name": "nervos_github_code",
+        "archive_db": "data/github_code/archive.db",
+    },
+}
+
+PUBLIC_BACKENDS = tuple(PUBLIC_BACKEND_OVERRIDES)
 
 
 def _point_id(record) -> str:
@@ -46,6 +68,33 @@ def _batched(rows: list, size: int):
         yield rows[idx : idx + size]
 
 
+def _assert_archive_ready(path: str) -> Path:
+    archive_path = resolve_project_path(path)
+    if not archive_path.is_file():
+        raise FileNotFoundError(
+            f"archive DB not found: {archive_path}. "
+            "Run `git lfs pull` if this file is LFS-backed, or ingest data first."
+        )
+    with archive_path.open("rb") as f:
+        prefix = f.read(128)
+    if prefix.startswith(b"version https://git-lfs.github.com/spec/"):
+        raise RuntimeError(
+            f"archive DB is still a Git LFS pointer, not real SQLite data: {archive_path}. "
+            "Run `git lfs pull` and retry."
+        )
+    return archive_path
+
+
+def load_public_backend_configs() -> list[tuple[str, RetrievalConfig]]:
+    """Return the publishable three-corpus layout without requiring config.yaml."""
+    base = RetrievalConfig()
+    configs: list[tuple[str, RetrievalConfig]] = []
+    for name in PUBLIC_BACKENDS:
+        merged = {**base.__dict__, **PUBLIC_BACKEND_OVERRIDES[name]}
+        configs.append((name, RetrievalConfig(**merged)))
+    return configs
+
+
 def migrate_backend(
     *,
     client: QdrantClient,
@@ -54,6 +103,7 @@ def migrate_backend(
     recreate: bool,
     batch_size: int,
 ) -> int:
+    _assert_archive_ready(cfg.archive_db)
     archive = ArchiveStore(db_path=cfg.archive_db, config=cfg)
     records = archive.list_all()
     existing = {c.name for c in client.get_collections().collections}
@@ -131,6 +181,23 @@ def main() -> int:
         default=256,
         help="Qdrant upsert batch size.",
     )
+    parser.add_argument(
+        "--backend",
+        action="append",
+        default=[],
+        help=(
+            "Config section to migrate. Repeatable. Defaults to config retrieval_backends. "
+            "Ignored when --public-default-backends is set."
+        ),
+    )
+    parser.add_argument(
+        "--public-default-backends",
+        action="store_true",
+        help=(
+            "Migrate the publishable docs/forum/github_code layout without requiring "
+            "a local config.yaml. Intended for fresh clone deployment bootstrap."
+        ),
+    )
     args = parser.parse_args()
 
     client = QdrantClient(url=args.url, api_key=args.api_key or None, timeout=30.0)
@@ -144,8 +211,13 @@ def main() -> int:
         )
         raise SystemExit(2) from exc
 
+    if args.public_default_backends:
+        backend_configs = load_public_backend_configs()
+    else:
+        backend_configs = load_retrieval_backend_configs(sections=args.backend or None)
+
     total = 0
-    for name, cfg in load_retrieval_backend_configs():
+    for name, cfg in backend_configs:
         cfg = RetrievalConfig(**{**cfg.__dict__, "qdrant_url": args.url})
         total += migrate_backend(
             client=client,

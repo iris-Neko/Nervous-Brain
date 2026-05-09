@@ -44,7 +44,7 @@ data/qdrant_github_code/meta.json
 data/sources/github_code.jsonl
 ```
 
-The current GitHub code corpus contains `23125` records across `169` repositories.
+The current GitHub code corpus contains `23247` records across `175` repositories.
 The local artifact size is roughly `334M`.
 
 ## Environment
@@ -104,7 +104,15 @@ The compose file binds Qdrant to localhost only:
 Rebuild server collections from SQLite archives:
 
 ```bash
-PYTHONPATH=src mamba run -n nervos-brain python scripts/migrate_qdrant_server_from_archive.py --recreate
+mamba run -n nervos-brain python scripts/migrate_qdrant_server_from_archive.py \
+  --public-default-backends \
+  --recreate
+```
+
+Fresh clone bootstrap:
+
+```bash
+bash bootstrap_qdrant_server.sh
 ```
 
 `config.yaml.example` defaults to:
@@ -116,6 +124,11 @@ retrieval:
 
 Clear `qdrant_url` to fall back to local Qdrant directory mode using
 `qdrant_path`.
+
+`data/qdrant_server/` is Docker's runtime storage and is intentionally ignored.
+Do not commit that directory. The portable source of truth is the tracked
+SQLite archive DBs plus the rebuild command above; after `git lfs pull`, a new
+machine can recreate the Docker Qdrant collections from those archives.
 
 ## Retrieval Data Layout
 

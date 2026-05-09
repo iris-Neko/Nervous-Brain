@@ -4,6 +4,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 from nervos_brain.retrieval import ArchiveRecord, ArchiveStore, RetrievalConfig
 
 
@@ -51,3 +53,45 @@ def test_migration_payload_and_point_id_are_stable(tmp_path):
     assert payload["topic"] == "nervosnetwork/fiber"
     assert payload["hash"] == "hash-r1"
     assert module._point_id(loaded) == module._point_id(loaded)
+
+
+def test_public_backend_configs_cover_publishable_three_corpora():
+    module = _load_script_module(
+        "migrate_qdrant_server_from_archive_public_configs_under_test",
+        "migrate_qdrant_server_from_archive.py",
+    )
+
+    configs = module.load_public_backend_configs()
+
+    assert [name for name, _ in configs] == [
+        "retrieval",
+        "retrieval_forum_talk",
+        "retrieval_github_code",
+    ]
+    assert [cfg.collection_name for _, cfg in configs] == [
+        "nervos_docs",
+        "nervos_talk_user_discussions",
+        "nervos_github_code",
+    ]
+    assert [cfg.archive_db for _, cfg in configs] == [
+        "data/archive.db",
+        "data/forum_talk/archive.db",
+        "data/github_code/archive.db",
+    ]
+
+
+def test_archive_ready_rejects_git_lfs_pointer(tmp_path):
+    module = _load_script_module(
+        "migrate_qdrant_server_from_archive_lfs_under_test",
+        "migrate_qdrant_server_from_archive.py",
+    )
+    pointer = tmp_path / "archive.db"
+    pointer.write_text(
+        "version https://git-lfs.github.com/spec/v1\n"
+        "oid sha256:0123456789abcdef\n"
+        "size 123\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="Git LFS pointer"):
+        module._assert_archive_ready(str(pointer))
