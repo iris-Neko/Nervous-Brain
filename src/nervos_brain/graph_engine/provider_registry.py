@@ -17,6 +17,8 @@ TaskType = Literal[
     "self_check",
     "general",
 ]
+ProfileTier = Literal["router", "low", "mini_high", "medium", "high"]
+ModelCostTier = Literal["low", "medium", "high"]
 
 
 @dataclass
@@ -26,13 +28,13 @@ class ModelCapability:
     supports_native_tool_call: bool = False
     supports_json_schema: bool = False
     max_context_tokens: int = 128_000
-    cost_tier: Literal["low", "medium", "high"] = "low"
+    cost_tier: ModelCostTier = "low"
     preferred_tasks: list[TaskType] = field(default_factory=lambda: ["general"])
 
 
 @dataclass(frozen=True)
 class ModelProfile:
-    tier: Literal["router", "low", "medium", "high"]
+    tier: ProfileTier
     model: str
     reasoning_effort: str = "low"
     verbosity: str = "low"
@@ -85,6 +87,13 @@ _DEFAULT_PROFILES: dict[str, ModelProfile] = {
         verbosity="low",
         max_tokens=2048,
     ),
+    "mini_high": ModelProfile(
+        tier="mini_high",
+        model="openai/gpt-5.4-mini",
+        reasoning_effort="high",
+        verbosity="low",
+        max_tokens=2048,
+    ),
     "medium": ModelProfile(
         tier="medium",
         model="openai/gpt-5.5",
@@ -108,7 +117,7 @@ def _load_profiles_from_config() -> dict[str, ModelProfile]:
         return dict(_DEFAULT_PROFILES)
 
     profiles = dict(_DEFAULT_PROFILES)
-    for tier in ("router", "low", "medium", "high"):
+    for tier in ("router", "low", "mini_high", "medium", "high"):
         section = raw.get(tier, {})
         if not isinstance(section, dict):
             continue
@@ -118,7 +127,7 @@ def _load_profiles_from_config() -> dict[str, ModelProfile]:
         except (TypeError, ValueError):
             max_tokens = base.max_tokens
         profiles[tier] = ModelProfile(
-            tier=tier,  # type: ignore[arg-type]
+            tier=tier,
             model=str(section.get("model", base.model) or base.model),
             reasoning_effort=str(
                 section.get("reasoning_effort", base.reasoning_effort)
@@ -139,14 +148,19 @@ class ProviderCapabilityRegistry:
         profiles: dict[str, ModelProfile] | None = None,
     ) -> None:
         self._models = models or list(_DEFAULT_REGISTRY)
-        self._profiles = profiles or _load_profiles_from_config()
+        if profiles is None:
+            self._profiles = _load_profiles_from_config()
+        else:
+            merged_profiles = dict(_DEFAULT_PROFILES)
+            merged_profiles.update(profiles)
+            self._profiles = merged_profiles
 
     def get_model_for(
         self,
         task_type: TaskType,
         *,
         require_json: bool = False,
-        max_cost: Literal["low", "medium", "high"] = "high",
+        max_cost: ModelCostTier = "high",
     ) -> str:
         """按能力匹配选模型，返回 model 名。"""
         cost_order = {"low": 0, "medium": 1, "high": 2}
@@ -173,9 +187,9 @@ class ProviderCapabilityRegistry:
         self,
         task_type: TaskType,
         *,
-        tier: Literal["router", "low", "medium", "high"] | str | None = None,
+        tier: ProfileTier | str | None = None,
         require_json: bool = False,
-        max_cost: Literal["low", "medium", "high"] = "high",
+        max_cost: ModelCostTier = "high",
     ) -> dict[str, Any]:
         """Return a concrete model profile for a graph node call."""
         _ = task_type, require_json, max_cost

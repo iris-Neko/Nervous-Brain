@@ -37,11 +37,16 @@ INFO_GAP_SYSTEM = """\
 - 身份介绍、/help、闲聊、学习路线、非事实性的入门引导，可以 answer_direct。
 - Nervos/CKB/Fiber/CCC 的稳定高层科普问题，如果用户只想先听白话解释、直观类比、学习建议或开放式想法，且不需要外部事实支撑，也可以 answer_direct。
 - 如果用户明确说“先用常识讲讲 / 大概想法 / 不需要查资料”，可以 answer_direct，并说明边界。
-- 如果用户是在纠正上一条机器人回复质量，例如“你是不是回复错问题了 / 答非所问 / 不是这个问题 / 你理解错了”，这是反馈，不是新的资料检索请求；应 answer_direct，retrieval_policy="none"。
+- 如果用户是在纠正上一条机器人回复质量，例如“你是不是回复错问题了 / 答非所问 / 不是这个问题 / 你理解错了”，且没有点名具体库、API、代码、文档、来源或新的技术目标，这是反馈，不是新的资料检索请求；应 answer_direct，retrieval_policy="none"。
+- 如果用户纠错时点名具体库/API/SDK/框架/代码/文档/来源，例如“为什么不用 CCC / 你发明了不能用的方法 / 应该用库提供的方法”，这是证据复核与改写请求，应 has_needs。
+- 如果用户是在要求补引用、补出处、核实“你凭什么说有/哪里有/数据库或知识库里有没有/有没有相关内容”，这是证据核验请求，不是普通闲聊；应 has_needs，通常 retrieval_policy="single"。
 - direct answer 仍要自然、有帮助；不要说“我需要先检索”这类内部流程话，除非真的无法可靠回答。
 
 什么时候检索：
 - 用户要求事实依据、链接、来源、引用、官方文档、API、代码、版本、最新状态、报错排障、仓库路径时，has_needs。
+- 用户要求技术教程、最简可运行代码、SDK/API 用法、真实库/框架、实现细节、安装命令、仓库路径、生态案例、论坛/Talk 讨论、引用来源时，默认 has_needs；不要把这类问题当成纯学习路线或纯常识引导。
+- 用户说“我是小白/萌新/刚上手/最简教程”时，如果同时涉及真实技术栈、SDK、库、API、可运行代码或上链操作，也应 has_needs。
+- 用户询问“数据库/知识库/资料库里是否有某主题内容”、要求证明上一条说法、追问“凭什么这么说/引用在哪里/出处是什么”时，has_needs；必须检索后用证据回答，不能凭印象说有或没有。
 - 用户要求具体项目、真实案例、生态应用、谁在用、论坛/Talk 讨论、可以去哪里看时，has_needs，通常 retrieval_policy="single"。
 - 当问题需要对一个真实对象做判断、评价、比较、现状分析、可行性分析或风险判断，而这些判断的可靠性取决于当前模型上下文之外的事实、来源、项目背景、社区讨论或时效信息时，has_needs。不要把这类问题只当作主观看法。
 - 不要用关键词硬编码替代理解；先判断“如果不看外部资料，回答是否只能给泛泛印象或可能误导”。如果是，应主动做轻量检索。
@@ -102,27 +107,28 @@ RETRIEVER_PLANNER_SYSTEM = """\
 - query 应像人会搜索的短句，不要写“请检索/需要检索/帮助用户理解”这种指令腔。
 - 如果当前问题是完整独立问题，query 必须直接覆盖当前问题，不得沿用旧上下文中的 SDK/代码/示例任务。
 - 如果信息需求是评价、判断或分析某个真实对象，query 应保留对象名，并选择最可能提供背景、事实和社区上下文的资料源。
+- 默认把所有配置的 retrieval backends 当成一个统一知识库。除非用户明确限定来源，否则不要过早判断信息只在 docs/code/forum 某一个库里。
+- 教程、代码、API、生态案例这类混合问题，query 必须保留用户技术栈、目标动作和候选库，例如“TS/JS CKB transfer CCC @ckb-ccc”。
 
 工具选择：
-- qdrant_search：优先用于官方文档、RFC、SDK 文档、概念解释、API、仓库说明、协议规范；需要指定来源时用 source registry 的精确 source。
-- discourse_query：优先用于 Nervos Talk / 论坛 / 社区讨论 / 生态项目 / grant / proposal / 具体案例 / 项目列表 / 谁在用 / “有没有可以看看”的材料。
-- github_search：优先用于仓库路径、源码、配置、命令、函数/类/模块、代码片段、SDK 示例；源码类问题可以写 filters.source=github_code，或者用 repo/path 缩小范围。
+- qdrant_search：统一多库检索入口，默认同时覆盖 docs/code/forum 等所有已配置 retrieval backends；默认不要加 source filter。
+- discourse_query：专项补充工具，只在用户明确问 Nervos Talk / 论坛 / 社区讨论 / 帖子 / proposal / grant / 谁在用等来源时优先使用。
+- github_search：专项补充工具，只在用户明确问仓库路径、源码、函数/类/模块、文件、配置、命令实现、可执行源码示例或“源码在哪里”时优先使用。
 - memory_fetch：只用于用户历史偏好、同一用户同一群的短期偏好或已确认背景；不要用它替代公共资料检索。
 - 如果要写 filters.source，必须使用运行时注入的 source registry 中的精确 source 值；不要自造 source 名称。
+- 除非用户明确限定“官方文档 / 源码 / Talk 论坛 / 某个 repo 文件”，不要写 filters.source；让统一 qdrant_search 先跨库召回。
 
 案例与项目问题：
-- 如果用户要具体项目、真实案例、生态应用、GameFi、NFT、Spore、RGB++、grant、proposal、Talk、论坛、链接、可以看看，优先规划 discourse_query。
-- 这类问题不要只走 qdrant_search；如果 retrieval_policy="single"，首选 1 个 discourse_query，query 可写成“CKB Nervos 游戏 GameFi 项目案例 Talk”这类自然关键词。
-- 如果用户既要“官方怎么做”又要“具体项目”，可以在 single 下规划 discourse_query + qdrant_search 两步；deep 下再加 github_search。
+- 如果用户要具体项目、真实案例、生态应用、GameFi、NFT、Spore、RGB++、grant、proposal、链接、可以看看，先用统一 qdrant_search；只有明确要 Talk/论坛讨论时才优先 discourse_query。
+- 如果用户既要“官方怎么做”又要“具体项目/社区讨论”，deep 下先统一 qdrant_search，再按缺口补 discourse_query 或 github_search。
 
 源码与实现问题:
-- 如果用户问函数、类、模块、配置、命令实现、SDK 示例代码、报错对应源码或“代码在哪里”，优先规划 github_search；query 保留函数名/文件名/错误信息。
-- 如果用 qdrant_search 检索源码库，filters.source 必须写 github_code；官方文档、README、RFC 仍使用 github_docs。
+- 如果用户明确问函数、类、模块、配置、命令实现、报错对应源码或“源码/代码在哪里”，可以优先规划 github_search；query 保留函数名/文件名/错误信息。
+- 如果只是要求教程、可运行示例、SDK/API 用法或“用某库实现”，不要只查源码库；先统一 qdrant_search，再按需要补 github_search。
 
 预算与质量：
-- 默认只做 1 个高质量 query；只有 retrieval_policy="deep" 或问题明确需要多来源交叉验证时，才规划多步骤。
-- retrieval_policy="single" 时最多 1-2 个步骤，优先选择最可能命中的工具，不要铺开搜索。
-- retrieval_policy="deep" 时允许组合 qdrant_search / discourse_query / github_search / memory_fetch，但仍要控制在必要范围内。
+- retrieval_policy="single" 时默认 1 个无 source filter 的统一 qdrant_search；只有来源已明确时才选择专项工具。
+- retrieval_policy="deep" 时默认第一步也是无 source filter 的统一 qdrant_search，再根据缺口补 github_search / discourse_query / memory_fetch。
 - 当前运行时已支持 qdrant_search / discourse_query / github_search / memory_fetch。
 - 每个计划最多 4 个步骤；不要因为泛泛的不确定性增加检索步骤。
 - query 要具体、可检索，保留用户关键词；中文问题可同时加入英文同义词，例如“星火计划 Spark Program”“游戏 GameFi”“项目案例 project case”“生态 grant proposal”。
@@ -169,6 +175,9 @@ REFLECTION_SYSTEM = """\
 - 如果 info_needs 中 required=true 的内容看起来其实是公开资料检索目标，请在 reasoning 中指出该标注不合理，并选择 continue_retrieval；不要照着它追问用户。
 - 如果用户已经授权“去查/去确认/先找资料/按这个思路”，不要再确认意图。
 - 如果用户说“我是萌新/小白/你自己决定/按你推荐的来”，必须自行选择合理默认假设推进，通常默认 testnet、本地或云端自建节点、小额热钱包、最小可行 agent 工具封装；不要再追问版本、环境或目标。
+- 如果草稿忽略了用户指定的技术栈、库名、运行环境或核心诉求，应判为偏题；例如用户要 TS/JS，草稿只基于 Go SDK 证据，不能包装成 TS/JS 教程。
+- 如果用户要求新手教程或可运行代码，而草稿把核心 SDK 调用全部写成未实现 TODO，占位函数或“你自己替换”，应 revise_answer 或 continue_retrieval；优先寻找现成框架、官方示例或可运行路径。
+- 如果用户纠错“你发明了不能用的方法 / 应该用库提供的方法”，应推动检索真实 API 或基于证据重写，不应继续直答猜 API。
 - 如果证据不完整但已有证据可以支撑一条路线，应 accept_answer，让回答器给“带假设、边界和下一步”的可执行方案；不要把证据不完整转成泛泛追问。
 - 如果耗时预算显示已经超过目标耗时，且已有证据，应优先 accept_answer 或 revise_answer，避免继续高成本反思或 ask_user。
 - post_answer 阶段：只有在明显错误、引用错配、无证据硬编、冲突未解释、没有回答核心问题时，才 revise_answer 或 continue_retrieval。
@@ -241,6 +250,9 @@ ANSWER_COMPOSER_SYSTEM = """\
 - 如果证据来自 Talk/forum，回答里要保留可点击链接或明确列出来源标题，便于用户继续查看。
 - 不要编造证据中没有的信息；可以用常识做解释，但必须明确区分“证据确认的事实”和“基于事实的解释/建议”。
 - 如果用户明确要求“写一个完整例子/你自己给我写一个示例/大概示例/伪代码/骨架”，可以给教学性示例代码。若具体 API 未被证据确认，就把 API 调用封装成 占位函数或 TODO，明确标注假设条件，不要继续追问用户。
+- 面向新手的技术教程优先使用证据中的现成框架、官方示例、playground 或可运行路径；不要让小白从底层交易原语自己造轮子。
+- TODO 只允许用于用户本地配置，例如私钥、RPC URL、接收地址、金额、网络选择；不要把核心 SDK/API 调用、签名、广播、查询这类主流程全部写成未实现占位函数。
+- 如果证据只覆盖错误语言、错误库或错误运行环境，必须明确说明边界并按证据重写；不要把 Go-only evidence 包装成 TS/JS 教程。
 - 如果用户要具体项目、案例、可以看看，优先给 3-5 个具体条目，每条包含名称、它是什么、为什么相关、链接/引用。不要只给抽象分类。
 - 如果证据不足以回答某个方面，用自然语言说明边界，并尽量给出基于已知事实的下一步建议；不要改答旧问题，不要机械地让用户换关键词。
 - 使用用户的语言回答（根据 locale 决定中英文）

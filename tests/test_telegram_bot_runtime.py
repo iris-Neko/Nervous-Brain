@@ -566,6 +566,33 @@ def test_group_reply_to_bot_processes_without_mention():
     assert fake_api.sent_requests[-1]["payload"]["reply_to_message_id"] == 1
 
 
+def test_group_reply_to_bot_injects_replied_message_context():
+    fake_api = _FakeAPI()
+    captured: dict[str, Any] = {}
+
+    def runner(state: dict[str, Any]) -> dict[str, Any]:
+        captured.update(state)
+        return {"_final_response": {"request_id": state["request_id"], "text": "ok"}}
+
+    gateway = TelegramPollingGateway(
+        api=fake_api,  # type: ignore[arg-type]
+        graph_runner=runner,
+        bot_user_id="999",
+        bot_username="NBCKB_Bot",
+    )
+
+    update = _sample_update(text="你都没给引用凭什么说有", reply_to_bot=True)
+    update["message"]["reply_to_message"]["text"] = "有，CCC 相关的基础概念我可以直接聊。"
+
+    row = gateway.process_update(update, dry_run=False)
+
+    assert row["ignored"] is False
+    assert captured["user_message"]["reply_to_message_id"] == "99"
+    assert "CCC 相关" in captured["user_message"]["reply_to_content"]
+    assert "当前消息正在回复这条 assistant 消息" in captured["conversation_context"]
+    assert "CCC 相关" in captured["conversation_context"]
+
+
 def test_group_reply_to_bot_outbound_override_still_replies_to_current_user_message():
     fake_api = _FakeAPI()
 
@@ -612,6 +639,15 @@ def test_process_update_writes_debug_event(tmp_path: Path):
             "_route_decision": "has_needs",
             "retrieval_policy": "single",
             "_tool_execution_summary": "tools=s1:github_search=ok:2",
+            "_tool_execution_trace": [
+                {
+                    "step_id": "s1",
+                    "tool": "qdrant_search",
+                    "status": "ok",
+                    "evidence_count": 2,
+                    "filter_notes": ["mapped_source:docs->github_docs"],
+                }
+            ],
             "_graph_elapsed_ms": 1234,
             "_node_timings": [{"node": "info_gap_assessor", "elapsed_ms": 100}],
             "_llm_usage_summary": {
@@ -633,7 +669,10 @@ def test_process_update_writes_debug_event(tmp_path: Path):
                 }
             ],
             "_ask_user_guard_reason": "ask_user_without_required_info",
-            "evidence": [{"id": "ev-1"}, {"id": "ev-2"}],
+            "evidence": [
+                {"id": "ev-1", "payload": {"source": "github_docs", "backend": "retrieval"}},
+                {"id": "ev-2", "payload": {"source": "github_code", "backend": "retrieval_github_code"}},
+            ],
             "_final_response": {
                 "request_id": state["request_id"],
                 "text": "answer [1]",
@@ -658,6 +697,9 @@ def test_process_update_writes_debug_event(tmp_path: Path):
     assert event["route_decision"] == "has_needs"
     assert event["retrieval_policy"] == "single"
     assert event["tool_summary"] == "tools=s1:github_search=ok:2"
+    assert event["tool_trace"][0]["filter_notes"] == ["mapped_source:docs->github_docs"]
+    assert {"source": "github_docs", "backend": "retrieval", "count": 1} in event["evidence_sources"]
+    assert {"source": "github_code", "backend": "retrieval_github_code", "count": 1} in event["evidence_sources"]
     assert event["evidence_count"] == 2
     assert event["citation_count"] == 1
     assert event["outbound_reply_to_message_id"] == "1"
@@ -899,6 +941,30 @@ def test_send_requests_retries_markdown_failure_as_plain_text():
     assert api.send_calls[1]["payload"]["reply_to_message_id"] == 5
 
 
+def test_send_requests_retries_entities_failure_as_plain_text():
+    api = _FlakyTelegramAPI(fail_count=1)
+    sent = api.send_requests(
+        [
+            {
+                "method": "sendMessage",
+                "payload": {
+                    "chat_id": -100123,
+                    "text": "bad entities",
+                    "entities": [{"type": "bold", "offset": 0, "length": 3}],
+                    "reply_to_message_id": 5,
+                },
+            }
+        ]
+    )
+
+    assert sent == 1
+    assert len(api.send_calls) == 2
+    assert "entities" in api.send_calls[0]["payload"]
+    assert "entities" not in api.send_calls[1]["payload"]
+    assert "parse_mode" not in api.send_calls[1]["payload"]
+    assert api.send_calls[1]["payload"]["reply_to_message_id"] == 5
+
+
 def test_send_requests_retries_reply_failure_as_detached_plain_text():
     api = _FlakyTelegramAPI(fail_count=2)
     sent = api.send_requests(
@@ -1073,6 +1139,10 @@ def test_build_runtime_defaults_to_dynamic_provider_registry(monkeypatch, tmp_pa
 
     assert isinstance(runtime.provider_registry, ProviderCapabilityRegistry)
     assert runtime.provider_registry.get_profile_for("general", tier="router")["tier"] == "router"
+    mini_high = runtime.provider_registry.get_profile_for("planning", tier="mini_high")
+    assert mini_high["tier"] == "mini_high"
+    assert mini_high["model"] == "openai/gpt-5.4-mini"
+    assert mini_high["reasoning_effort"] == "high"
     assert memory_service is not None
 
 
@@ -1089,7 +1159,7 @@ def test_build_runtime_model_argument_forces_fixed_registry(monkeypatch, tmp_pat
         memory_db=tmp_path / "memory.db",
     )
 
-    profile = runtime.provider_registry.get_profile_for("composing", tier="high")
+    profile = runtime.provider_registry.get_profile_for("composing", tier="mini_high")
     assert profile["model"] == "openai/gpt-5.5"
     assert profile["reasoning_effort"] == ""
 

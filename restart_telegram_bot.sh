@@ -4,11 +4,14 @@ set -Eeuo pipefail
 ENV_NAME="${ENV_NAME:-nervos-brain}"
 SCRIPT_PATH="${SCRIPT_PATH:-scripts/run_telegram_bot_polling.py}"
 MAMBA_BIN="${MAMBA_BIN:-${MICROMAMBA_BIN:-mamba}}"
+PYTHON_BIN="${PYTHON_BIN:-}"
 LOG_DIR="${LOG_DIR:-data/logs}"
 STARTUP_WAIT_SECONDS="${STARTUP_WAIT_SECONDS:-3}"
 DEBUG="${DEBUG:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 DROP_PENDING_ON_START="${DROP_PENDING_ON_START:-0}"
+USE_SYSTEMD_USER="${USE_SYSTEMD_USER:-auto}"
+SYSTEMD_UNIT="${SYSTEMD_UNIT:-nervos-brain-telegram}"
 
 ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 cd "$ROOT"
@@ -30,7 +33,13 @@ print_log_tail() {
 }
 
 bot_pids() {
-  pgrep -f "$SCRIPT_PATH|$SCRIPT_NAME" 2>/dev/null | grep -v "^$$$" || true
+  ps -eo pid=,args= \
+    | awk -v script="$SCRIPT_PATH" '
+        index($0, script) && $0 !~ /awk -v script=/ {
+          print $1
+        }
+      ' \
+    | grep -v "^$$$" || true
 }
 
 if [[ ! -f "$SCRIPT_PATH" ]]; then
@@ -45,7 +54,23 @@ if ! command -v "$MAMBA_BIN" >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ -z "$PYTHON_BIN" ]]; then
+  PYTHON_BIN="$("$MAMBA_BIN" run -n "$ENV_NAME" python -c 'import sys; print(sys.executable)')"
+fi
+
+if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then
+  echo "Cannot find executable Python for env=$ENV_NAME: $PYTHON_BIN" >&2
+  echo "Set PYTHON_BIN=/path/to/env/bin/python or check the mamba environment." >&2
+  exit 1
+fi
+
 echo "[1/3] Stopping existing Telegram bot processes..."
+if [[ "$USE_SYSTEMD_USER" != "0" && "$USE_SYSTEMD_USER" != "false" ]] \
+  && command -v systemctl >/dev/null 2>&1 \
+  && systemctl --user show-environment >/dev/null 2>&1; then
+  systemctl --user stop "$SYSTEMD_UNIT.service" 2>/dev/null || true
+fi
+
 mapfile -t existing_pids < <(bot_pids)
 for pid in "${existing_pids[@]}"; do
   if [[ -n "$pid" ]]; then
@@ -69,7 +94,7 @@ if (( ${#still_running[@]} > 0 )); then
 fi
 
 echo "[2/3] Starting Telegram bot..."
-args=(run -n "$ENV_NAME" python "$SCRIPT_PATH")
+args=("$SCRIPT_PATH")
 if [[ "$DEBUG" == "1" || "$DEBUG" == "true" ]]; then
   args+=(--debug)
 fi
@@ -80,11 +105,39 @@ if [[ "$DROP_PENDING_ON_START" == "1" || "$DROP_PENDING_ON_START" == "true" ]]; 
   args+=(--drop-pending-on-start)
 fi
 
-nohup "$MAMBA_BIN" "${args[@]}" >"$STDOUT_LOG" 2>"$STDERR_LOG" &
-bot_pid="$!"
+if [[ "$USE_SYSTEMD_USER" != "0" && "$USE_SYSTEMD_USER" != "false" ]] \
+  && command -v systemd-run >/dev/null 2>&1 \
+  && systemctl --user show-environment >/dev/null 2>&1; then
+  systemd-run --user \
+    --unit="$SYSTEMD_UNIT" \
+    --same-dir \
+    --property=Restart=on-failure \
+    --property=RestartSec=5 \
+    --property=StandardOutput="append:$ROOT/$STDOUT_LOG" \
+    --property=StandardError="append:$ROOT/$STDERR_LOG" \
+    "$PYTHON_BIN" "${args[@]}" >/dev/null
+  sleep 1
+  bot_pid="$(systemctl --user show "$SYSTEMD_UNIT.service" --property=MainPID --value 2>/dev/null || true)"
+else
+  nohup "$PYTHON_BIN" "${args[@]}" >"$STDOUT_LOG" 2>"$STDERR_LOG" &
+  bot_pid="$!"
+fi
+
+if [[ -z "$bot_pid" || "$bot_pid" == "0" ]]; then
+  echo "Failed to start Telegram bot process." >&2
+  print_log_tail "$STDERR_LOG" "stderr"
+  print_log_tail "$STDOUT_LOG" "stdout"
+  exit 1
+fi
 echo "$bot_pid" > "$PID_FILE"
 
 echo "  pid=$bot_pid"
+echo "  python=$PYTHON_BIN"
+if [[ "$USE_SYSTEMD_USER" != "0" && "$USE_SYSTEMD_USER" != "false" ]] \
+  && command -v systemctl >/dev/null 2>&1 \
+  && systemctl --user status "$SYSTEMD_UNIT.service" >/dev/null 2>&1; then
+  echo "  systemd_user_unit=$SYSTEMD_UNIT.service"
+fi
 echo "  stdout=$STDOUT_LOG"
 echo "  stderr=$STDERR_LOG"
 

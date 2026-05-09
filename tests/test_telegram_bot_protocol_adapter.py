@@ -83,6 +83,32 @@ def test_update_to_envelope_command_with_bot_username_and_args():
     assert env["command_args"] == "fiber open channel"
 
 
+def test_update_to_envelope_preserves_reply_content_snapshot():
+    update = {
+        "update_id": 10022,
+        "message": {
+            "message_id": 12,
+            "date": 1711111112,
+            "text": "你都没给引用凭什么说有",
+            "chat": {"id": -100100, "type": "supergroup"},
+            "from": {"id": 8},
+            "reply_to_message": {
+                "message_id": 11,
+                "date": 1711111111,
+                "text": "有，CCC 相关的基础概念我可以直接聊。",
+                "chat": {"id": -100100, "type": "supergroup"},
+                "from": {"id": 999, "is_bot": True, "username": "NBCKB_Bot"},
+            },
+        },
+    }
+
+    env = telegram_update_to_message_envelope(update)
+
+    assert env["reply_to_message_id"] == "11"
+    assert env["reply_to_role"] == "assistant"
+    assert "CCC 相关" in env["reply_to_content"]
+
+
 def test_update_to_envelope_with_attachments():
     update = {
         "update_id": 1003,
@@ -154,6 +180,66 @@ def test_outbound_to_telegram_requests_markdown_reply():
     assert reqs[0]["payload"]["parse_mode"] == "MarkdownV2"
     assert reqs[0]["payload"]["reply_to_message_id"] == 333
     assert "reply_to_message_id" not in reqs[1]["payload"]
+
+
+def test_outbound_to_telegram_requests_uses_entities_without_parse_mode():
+    outbound = {
+        "request_id": "req1",
+        "context": {"platform": "telegram", "user_id": "42", "channel_id": "-10088"},
+        "reply_to_message_id": "333",
+        "segments": [
+            {
+                "segment_id": "req1:0",
+                "index": 0,
+                "text": "part1",
+                "char_count": 5,
+                "citation_labels": [],
+                "entities": [{"type": "bold", "offset": 0, "length": 5}],
+            },
+            {
+                "segment_id": "req1:1",
+                "index": 1,
+                "text": "part2",
+                "char_count": 5,
+                "citation_labels": [],
+                "entities": [{"type": "italic", "offset": 0, "length": 5}],
+            },
+        ],
+        "render_mode": "markdown",
+        "append_csat": False,
+    }
+
+    reqs = outbound_message_to_telegram_requests(outbound)
+
+    assert reqs[0]["payload"]["entities"] == [{"type": "bold", "offset": 0, "length": 5}]
+    assert "parse_mode" not in reqs[0]["payload"]
+    assert reqs[0]["payload"]["reply_to_message_id"] == 333
+    assert "parse_mode" not in reqs[1]["payload"]
+    assert "reply_to_message_id" not in reqs[1]["payload"]
+
+
+def test_outbound_to_telegram_requests_can_disable_parse_mode_without_entities():
+    outbound = {
+        "request_id": "req1",
+        "context": {"platform": "telegram", "user_id": "42", "channel_id": "-10088"},
+        "segments": [
+            {
+                "segment_id": "req1:0",
+                "index": 0,
+                "text": "plain telegramify tail",
+                "char_count": 22,
+                "citation_labels": [],
+                "parse_mode_enabled": False,
+            }
+        ],
+        "render_mode": "markdown",
+        "append_csat": False,
+    }
+
+    reqs = outbound_message_to_telegram_requests(outbound)
+
+    assert "entities" not in reqs[0]["payload"]
+    assert "parse_mode" not in reqs[0]["payload"]
 
 
 def test_outbound_to_telegram_requests_attaches_csat_to_last_segment_only():

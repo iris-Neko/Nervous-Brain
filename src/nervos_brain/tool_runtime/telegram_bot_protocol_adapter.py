@@ -78,6 +78,12 @@ def telegram_update_to_message_envelope(
     reply_to = msg.get("reply_to_message", {})
     if isinstance(reply_to, dict) and reply_to.get("message_id") is not None:
         message["reply_to_message_id"] = str(reply_to["message_id"])
+        reply_text = _strip_bot_mentions(_extract_text(reply_to))
+        if reply_text:
+            message["reply_to_content"] = _truncate_reply_content(reply_text)
+        reply_sender = reply_to.get("from", {})
+        if isinstance(reply_sender, dict):
+            message["reply_to_role"] = "assistant" if bool(reply_sender.get("is_bot")) else "user"
 
     attachments = _extract_attachments(msg)
     if attachments:
@@ -176,7 +182,10 @@ def outbound_message_to_telegram_requests(
             "text": str(segment.get("text", "")),
             "disable_web_page_preview": True,
         }
-        if render_mode == "markdown":
+        entities = segment.get("entities")
+        if isinstance(entities, list) and entities:
+            payload["entities"] = entities
+        elif render_mode == "markdown" and segment.get("parse_mode_enabled", True):
             payload["parse_mode"] = "MarkdownV2"
         if idx == 0 and reply_to:
             payload["reply_to_message_id"] = _coerce_numeric_or_keep(reply_to)
@@ -203,6 +212,13 @@ def _strip_bot_mentions(text: str) -> str:
     cleaned = re.sub(r"@\w+_Bot\b", "", str(text), flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
+
+
+def _truncate_reply_content(text: str, limit: int = 700) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit].rstrip() + "..."
 
 
 def _parse_command(text: str) -> tuple[str | None, str | None]:

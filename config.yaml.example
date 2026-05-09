@@ -30,6 +30,39 @@ llm:
   # 是否禁用响应存储（store=false）
   disable_response_storage: true
 
+llm_profiles:
+  # 动态 graph 路由使用的模型档位。router 只负责选档，不直接回答用户。
+  router:
+    tier: "router"
+    model: "openai/gpt-5.4-mini"
+    reasoning_effort: "medium"
+    verbosity: "low"
+    max_tokens: 512
+  low:
+    tier: "low"
+    model: "openai/gpt-5.4-mini"
+    reasoning_effort: "low"
+    verbosity: "low"
+    max_tokens: 2048
+  mini_high:
+    tier: "mini_high"
+    model: "openai/gpt-5.4-mini"
+    reasoning_effort: "high"
+    verbosity: "low"
+    max_tokens: 2048
+  medium:
+    tier: "medium"
+    model: "openai/gpt-5.5"
+    reasoning_effort: "low"
+    verbosity: "low"
+    max_tokens: 2048
+  high:
+    tier: "high"
+    model: "openai/gpt-5.5"
+    reasoning_effort: "high"
+    verbosity: "low"
+    max_tokens: 4096
+
 logging:
   # 全局日志级别：DEBUG / INFO / WARNING / ERROR
   level: "INFO"

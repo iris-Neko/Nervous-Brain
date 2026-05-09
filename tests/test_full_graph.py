@@ -222,6 +222,8 @@ class TestDirectAnswerScenario:
 
         def mock_call_llm_json(system_prompt, user_prompt, **_kwargs):
             _ = user_prompt
+            if "模型档位路由器" in system_prompt:
+                return {"tier": "low", "reasoning": "simple direct answer", "confidence": 0.9}
             if "信息缺口评估" in system_prompt:
                 call_counter["info_gap"] += 1
                 return {
@@ -263,9 +265,16 @@ class TestDirectAnswerScenario:
         from nervos_brain.graph_engine.full_graph import build_full_graph
 
         def mock_call_llm_json(system_prompt, user_prompt, **_kwargs):
-            _ = user_prompt
-            assert "模型档位路由器" in system_prompt
-            return {"tier": "low", "reasoning": "short correction feedback", "confidence": 0.9}
+            if "模型档位路由器" in system_prompt:
+                return {"tier": "low", "reasoning": "short correction feedback", "confidence": 0.9}
+            assert "信息缺口评估" in system_prompt
+            assert "你是不是回复错问题了" in user_prompt
+            return {
+                "decision": "answer_direct",
+                "retrieval_policy": "none",
+                "info_needs": [],
+                "reasoning": "pure answer quality feedback",
+            }
 
         def mock_call_llm(system_prompt, user_prompt, **_kwargs):
             assert "直接回答器" in system_prompt
@@ -463,6 +472,143 @@ class TestSingleRetrievalScenario:
         assert step["filters"] == {"source": "github_code", "topic": "nervosnetwork/fiber"}
         assert "mapped_source:code->github_code" in step["filter_notes"]
 
+    def test_retriever_planner_respects_llm_unified_search_plan(self):
+        from nervos_brain.graph_engine.full_nodes import retriever_planner
+
+        def mock_call_llm_json(system_prompt: str, user_prompt: str, **_kwargs):
+            _ = system_prompt, user_prompt
+            if "模型档位路由器" in system_prompt:
+                return {"tier": "mini_high", "reasoning": "technical retrieval", "confidence": 0.9}
+            return {
+                "plan_id": "plan_ccc",
+                "rationale": "tutorial lookup",
+                "steps": [
+                    {
+                        "step_id": "step_1",
+                        "tool": "qdrant_search",
+                        "query": "TS/JS CKB transfer CCC @ckb-ccc tutorial",
+                        "filters": {},
+                        "top_k": 5,
+                    }
+                ],
+                "parallel_groups": [["step_1"]],
+                "budget": {"max_tool_calls": 1},
+            }
+
+        state = _make_state(
+            user_message={"content": "我是 TS/JS 小白，想用 CCC 写 CKB 转账最简教程。"},
+            info_needs=[
+                {
+                    "kind": "latest_spec",
+                    "question": "CCC TypeScript CKB transfer tutorial and examples",
+                    "required": False,
+                }
+            ],
+            retrieval_policy="single",
+        )
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm_json", mock_call_llm_json):
+            out = retriever_planner(state)
+
+        step = out["retrieval_plan"]["steps"][0]
+        assert step["tool"] == "qdrant_search"
+        assert step["filters"] == {}
+        assert "filter_notes" not in step
+
+    def test_retriever_planner_keeps_source_filter_when_user_limits_to_talk(self):
+        from nervos_brain.graph_engine.full_nodes import retriever_planner
+
+        def mock_call_llm_json(system_prompt: str, user_prompt: str, **_kwargs):
+            _ = system_prompt, user_prompt
+            if "模型档位路由器" in system_prompt:
+                return {"tier": "mini_high", "reasoning": "forum lookup", "confidence": 0.9}
+            return {
+                "plan_id": "plan_talk",
+                "rationale": "forum lookup",
+                "steps": [
+                    {
+                        "step_id": "step_1",
+                        "tool": "qdrant_search",
+                        "query": "CCC Fiber Talk forum discussion",
+                        "filters": {"source": "nervos_talk"},
+                        "top_k": 5,
+                    }
+                ],
+                "parallel_groups": [["step_1"]],
+                "budget": {"max_tool_calls": 1},
+            }
+
+        state = _make_state(
+            user_message={"content": "Talk 里有没有 CCC/Fiber 讨论？"},
+            info_needs=[
+                {
+                    "kind": "historical_consensus",
+                    "question": "Nervos Talk CCC Fiber discussion",
+                    "required": False,
+                }
+            ],
+            retrieval_policy="single",
+        )
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm_json", mock_call_llm_json):
+            out = retriever_planner(state)
+
+        step = out["retrieval_plan"]["steps"][0]
+        assert step["filters"] == {"source": "nervos_talk"}
+        assert step.get("filter_notes") is None
+
+    def test_retrieval_executor_preserves_filter_notes(self):
+        from nervos_brain.graph_engine.full_nodes import retrieval_executor
+
+        class FakeRetriever:
+            def __init__(self) -> None:
+                self.calls: list[dict | None] = []
+
+            def search(self, query: str, filters=None, top_k: int = 5):
+                _ = query, top_k
+                self.calls.append(filters)
+                return [
+                    {
+                        "id": "ccc-transfer",
+                        "source": "qdrant",
+                        "title": "CCC transfer example",
+                        "url": "https://github.com/ckb-devrel/ccc",
+                        "anchor": "ccc-transfer",
+                        "snippet": "TypeScript transfer example.",
+                        "score": 0.9,
+                        "payload": {"source": "github_code", "backend": "retrieval_github_code"},
+                        "hash": "h-ccc",
+                        "retrieved_ts_ms": 1,
+                    }
+                ]
+
+        retriever = FakeRetriever()
+        state = _make_state(
+            request_id="test-filter-note-trace",
+            _multi_retriever=retriever,
+            retrieval_plan={
+                "plan_id": "p-filter-note",
+                "steps": [
+                    {
+                        "step_id": "step_1",
+                        "tool": "qdrant_search",
+                        "query": "TS/JS CKB transfer CCC",
+                        "filters": {},
+                        "filter_notes": ["mapped_source:docs->github_docs"],
+                        "top_k": 5,
+                    }
+                ],
+            },
+            budget={"max_tool_calls": 2, "max_evidence_chunks": 5},
+        )
+
+        out = retrieval_executor(state)
+
+        assert retriever.calls == [None]
+        assert out["_tool_execution_trace"][0]["filter_notes"] == [
+            "mapped_source:docs->github_docs"
+        ]
+
     def test_retrieval_executor_retries_empty_filtered_qdrant_without_filters(self):
         from nervos_brain.graph_engine.full_nodes import retrieval_executor
 
@@ -607,6 +753,8 @@ class TestSingleRetrievalScenario:
 
         def mock_call_llm_json(system_prompt, user_prompt, *, model=None):
             _ = user_prompt, model
+            if "模型档位路由器" in system_prompt:
+                return {"tier": "mini_high", "reasoning": "technical graph node", "confidence": 0.9}
             if "信息缺口评估" in system_prompt:
                 return {
                     "decision": "has_needs",
@@ -1161,7 +1309,7 @@ class TestInfoGapAssessorNode:
         assert out["retrieval_policy"] == "none"
         assert out["budget"]["max_tool_calls"] == 0
 
-    def test_response_quality_feedback_routes_to_direct_answer_without_retrieval(self):
+    def test_response_quality_feedback_uses_info_gap_prompt_decision(self):
         from nervos_brain.graph_engine.full_nodes import info_gap_assessor
 
         state = _make_state(
@@ -1171,9 +1319,17 @@ class TestInfoGapAssessorNode:
                 {"role": "assistant", "content": "我不需要你补充版本或环境。"},
             ],
         )
+        mock_json_responses = {
+            "信息缺口评估": {
+                "decision": "answer_direct",
+                "retrieval_policy": "none",
+                "info_needs": [],
+                "reasoning": "pure answer quality feedback",
+            }
+        }
         with patch(
             "nervos_brain.graph_engine.full_nodes.call_llm_json",
-            side_effect=AssertionError("feedback routing should not call LLM planner"),
+            _mock_call_llm_json_factory(mock_json_responses),
         ):
             out = info_gap_assessor(state)
 
@@ -1181,6 +1337,75 @@ class TestInfoGapAssessorNode:
         assert out["retrieval_policy"] == "none"
         assert out["info_needs"] == []
         assert out["budget"]["max_tool_calls"] == 0
+
+    def test_technical_feedback_with_named_library_can_route_to_retrieval(self):
+        from nervos_brain.graph_engine.full_nodes import info_gap_assessor
+
+        state = _make_state(
+            user_message={
+                "content": "你为什么不用 CCC 这个库提供教程，而是给了一个啥也不是的东西？"
+            },
+            recent_messages=[
+                {"role": "user", "content": "我的技术栈是 TS/JS，想写 CKB 转账小应用。"},
+                {"role": "assistant", "content": "这里是一个 TODO 骨架。"},
+            ],
+        )
+        mock_json_responses = {
+            "信息缺口评估": {
+                "decision": "has_needs",
+                "retrieval_policy": "single",
+                "info_needs": [
+                    {
+                        "kind": "latest_spec",
+                        "question": "CCC TypeScript CKB transfer tutorial and examples",
+                        "required": False,
+                    }
+                ],
+                "reasoning": "the correction names a public library and asks for evidence-backed rewrite",
+            }
+        }
+        with patch(
+            "nervos_brain.graph_engine.full_nodes.call_llm_json",
+            _mock_call_llm_json_factory(mock_json_responses),
+        ):
+            out = info_gap_assessor(state)
+
+        assert out["_route_decision"] == "has_needs"
+        assert out["retrieval_policy"] == "single"
+        assert out["info_needs"][0]["required"] is False
+
+    def test_technical_tutorial_retrieval_is_llm_prompt_decision(self):
+        from nervos_brain.graph_engine.full_nodes import info_gap_assessor
+
+        state = _make_state(
+            user_message={
+                "content": "我是 TS/JS 小白，给我一个 CKB 转账最简可运行教程。"
+            },
+        )
+        mock_json_responses = {
+            "信息缺口评估": {
+                "decision": "has_needs",
+                "retrieval_policy": "single",
+                "info_needs": [
+                    {
+                        "kind": "latest_spec",
+                        "question": "TS/JS CKB transfer tutorial with real SDK or framework",
+                        "required": False,
+                    }
+                ],
+                "reasoning": "a runnable technical tutorial needs public docs and examples",
+            }
+        }
+        with patch(
+            "nervos_brain.graph_engine.full_nodes.call_llm_json",
+            _mock_call_llm_json_factory(mock_json_responses),
+        ):
+            out = info_gap_assessor(state)
+
+        assert out["_route_decision"] == "has_needs"
+        assert out["retrieval_policy"] == "single"
+        assert out["info_needs"][0]["required"] is False
+        assert out["budget"]["max_tool_calls"] >= 1
 
     def test_answer_direct_is_coerced_to_has_needs_when_force_retrieval(self):
         from nervos_brain.graph_engine.full_nodes import info_gap_assessor
@@ -1410,15 +1635,23 @@ class TestPromptBoundaries:
         assert "这是授权你检索，不是让你追问确认" in prompts.INFO_GAP_SYSTEM
         assert "不要再追问" in prompts.INFO_GAP_SYSTEM
         assert "答非所问" in prompts.INFO_GAP_SYSTEM
+        assert "数据库或知识库里有没有" in prompts.INFO_GAP_SYSTEM
+        assert "凭什么说有" in prompts.INFO_GAP_SYSTEM
+        assert "必须检索后用证据回答" in prompts.INFO_GAP_SYSTEM
+        assert "技术教程、最简可运行代码" in prompts.INFO_GAP_SYSTEM
+        assert "为什么不用 CCC" in prompts.INFO_GAP_SYSTEM
+        assert "小白/萌新/刚上手" in prompts.INFO_GAP_SYSTEM
 
-    def test_retriever_planner_prompt_prefers_minimal_search(self):
+    def test_retriever_planner_prompt_prefers_unified_search(self):
         from nervos_brain.graph_engine import prompts
 
-        assert "默认只做 1 个高质量 query" in prompts.RETRIEVER_PLANNER_SYSTEM
+        assert "统一知识库" in prompts.RETRIEVER_PLANNER_SYSTEM
+        assert "统一多库检索入口" in prompts.RETRIEVER_PLANNER_SYSTEM
+        assert "默认不要加 source filter" in prompts.RETRIEVER_PLANNER_SYSTEM
         assert "retrieval_policy=\"single\"" in prompts.RETRIEVER_PLANNER_SYSTEM
         assert "{retrieval_policy}" in prompts.RETRIEVER_PLANNER_USER
-        assert "优先规划 discourse_query" in prompts.RETRIEVER_PLANNER_SYSTEM
-        assert "这类问题不要只走 qdrant_search" in prompts.RETRIEVER_PLANNER_SYSTEM
+        assert "先统一 qdrant_search" in prompts.RETRIEVER_PLANNER_SYSTEM
+        assert "TS/JS CKB transfer CCC" in prompts.RETRIEVER_PLANNER_SYSTEM
         assert "不要写“请检索/需要检索/帮助用户理解”这种指令腔" in prompts.RETRIEVER_PLANNER_SYSTEM
         assert "评价、判断或分析某个真实对象" in prompts.RETRIEVER_PLANNER_SYSTEM
 
@@ -1438,12 +1671,26 @@ class TestPromptBoundaries:
         assert "默认 testnet" in prompts.REFLECTION_SYSTEM
         assert "不要用 ask_user 处理公开资料缺口" in prompts.REFLECTION_SYSTEM
         assert "超过目标耗时" in prompts.REFLECTION_SYSTEM
+        assert "Go SDK" in prompts.REFLECTION_SYSTEM
+        assert "全部写成未实现 TODO" in prompts.REFLECTION_SYSTEM
+        assert "你发明了不能用的方法" in prompts.REFLECTION_SYSTEM
 
-    def test_model_router_prompt_discourages_high_for_routine_reflection(self):
+    def test_model_router_prompt_uses_mini_high_medium_and_high(self):
         from nervos_brain.graph_engine import full_nodes
 
-        assert "reflection_pre 的常规任务通常选择 low 或 medium" in full_nodes._LLM_ROUTER_SYSTEM
+        assert "不要过度省模型" in full_nodes._LLM_ROUTER_SYSTEM
+        assert "low、mini_high、medium、high 四档之一" in full_nodes._LLM_ROUTER_SYSTEM
+        assert "低成本深思考档" in full_nodes._LLM_ROUTER_SYSTEM
+        assert "技术类 graph 节点应至少选择 mini_high" in full_nodes._LLM_ROUTER_SYSTEM
+        assert "草稿是否把 A 项目证据泛化到 B 项目" in full_nodes._LLM_ROUTER_SYSTEM
+        assert "应优先选择 high" in full_nodes._LLM_ROUTER_SYSTEM
         assert "已超过目标耗时" in full_nodes._LLM_ROUTER_SYSTEM
+        assert full_nodes._MODEL_TIERS == {"low", "mini_high", "medium", "high"}
+        assert full_nodes._NODE_FALLBACK_TIERS["info_gap_assessor"] == "mini_high"
+        assert full_nodes._NODE_FALLBACK_TIERS["retriever_planner"] == "mini_high"
+        assert full_nodes._NODE_FALLBACK_TIERS["reflection_pre"] == "mini_high"
+        assert full_nodes._NODE_FALLBACK_TIERS["reflection_post"] == "medium"
+        assert full_nodes._NODE_FALLBACK_TIERS["direct_answer"] == "low"
 
     def test_answer_composer_prompt_prioritizes_current_question_and_allows_examples(self):
         from nervos_brain.graph_engine import prompts
@@ -1452,6 +1699,9 @@ class TestPromptBoundaries:
         assert "不要回答旧问题" in prompts.ANSWER_COMPOSER_SYSTEM
         assert "教学性示例代码" in prompts.ANSWER_COMPOSER_SYSTEM
         assert "占位函数或 TODO" in prompts.ANSWER_COMPOSER_SYSTEM
+        assert "现成框架" in prompts.ANSWER_COMPOSER_SYSTEM
+        assert "私钥、RPC URL、接收地址、金额" in prompts.ANSWER_COMPOSER_SYSTEM
+        assert "Go-only evidence" in prompts.ANSWER_COMPOSER_SYSTEM
         assert "每条包含名称、它是什么、为什么相关、链接/引用" in prompts.ANSWER_COMPOSER_SYSTEM
         assert "Talk/forum" in prompts.ANSWER_COMPOSER_SYSTEM
 
@@ -1481,21 +1731,53 @@ class TestProviderRegistry:
         assert model in ("gpt-4o", "claude-3-5-sonnet-20241022")
 
     def test_get_profile_for_uses_default_router_tiers(self):
-        from nervos_brain.graph_engine.provider_registry import ProviderCapabilityRegistry
-        reg = ProviderCapabilityRegistry()
+        from nervos_brain.graph_engine.provider_registry import ModelProfile, ProviderCapabilityRegistry
+        reg = ProviderCapabilityRegistry(
+            profiles={
+                "router": ModelProfile("router", "openai/gpt-5.4-mini", "low", "low", 512),
+                "low": ModelProfile("low", "openai/gpt-5.4-mini", "low", "low", 2048),
+                "mini_high": ModelProfile("mini_high", "openai/gpt-5.4-mini", "high", "low", 2048),
+                "medium": ModelProfile("medium", "openai/gpt-5.5", "low", "low", 2048),
+                "high": ModelProfile("high", "openai/gpt-5.5", "high", "low", 4096),
+            }
+        )
 
         router = reg.get_profile_for("general", tier="router", require_json=True)
         low = reg.get_profile_for("planning", tier="low", require_json=True)
+        mini_high = reg.get_profile_for("planning", tier="mini_high", require_json=True)
         medium = reg.get_profile_for("reflection", tier="medium", require_json=True)
         high = reg.get_profile_for("composing", tier="high")
+        unknown = reg.get_profile_for("general", tier="unknown")
 
         assert router["model"] == "openai/gpt-5.4-mini"
         assert router["reasoning_effort"] == "low"
         assert low["model"] == "openai/gpt-5.4-mini"
+        assert low["reasoning_effort"] == "low"
+        assert mini_high["tier"] == "mini_high"
+        assert mini_high["model"] == "openai/gpt-5.4-mini"
+        assert mini_high["reasoning_effort"] == "high"
         assert medium["model"] == "openai/gpt-5.5"
         assert medium["reasoning_effort"] == "low"
         assert high["model"] == "openai/gpt-5.5"
         assert high["reasoning_effort"] == "high"
+        assert unknown["tier"] == "low"
+
+    def test_provider_registry_adds_default_mini_high_when_config_missing_it(self):
+        from nervos_brain.graph_engine.provider_registry import ModelProfile, ProviderCapabilityRegistry
+        reg = ProviderCapabilityRegistry(
+            profiles={
+                "router": ModelProfile("router", "openai/gpt-5.4-mini", "low", "low", 512),
+                "low": ModelProfile("low", "openai/gpt-5.4-mini", "low", "low", 2048),
+                "medium": ModelProfile("medium", "openai/gpt-5.5", "low", "low", 2048),
+                "high": ModelProfile("high", "openai/gpt-5.5", "high", "low", 4096),
+            }
+        )
+
+        mini_high = reg.get_profile_for("planning", tier="mini_high", require_json=True)
+
+        assert mini_high["tier"] == "mini_high"
+        assert mini_high["model"] == "openai/gpt-5.4-mini"
+        assert mini_high["reasoning_effort"] == "high"
 
 
 class TestRuntimeInjection:
@@ -1571,6 +1853,97 @@ class TestRuntimeInjection:
 class TestNodeModelRouter:
     """节点级模型 router 测试。"""
 
+    def test_info_gap_uses_router_selected_mini_high_profile(self):
+        from nervos_brain.graph_engine.full_nodes import info_gap_assessor
+        from nervos_brain.graph_engine.provider_registry import ModelProfile, ProviderCapabilityRegistry
+
+        registry = ProviderCapabilityRegistry(
+            profiles={
+                "router": ModelProfile("router", "openai/gpt-5.4-mini", "low", "low", 512),
+                "low": ModelProfile("low", "openai/gpt-5.4-mini", "low", "low", 2048),
+                "mini_high": ModelProfile("mini_high", "openai/gpt-5.4-mini", "high", "low", 2048),
+                "medium": ModelProfile("medium", "openai/gpt-5.5", "low", "low", 2048),
+                "high": ModelProfile("high", "openai/gpt-5.5", "high", "low", 4096),
+            }
+        )
+        calls: list[dict] = []
+
+        def mock_call_llm_json(system_prompt, user_prompt, *, model=None, reasoning_effort=None, verbosity=None, max_tokens=None):
+            calls.append(
+                {
+                    "system": system_prompt,
+                    "user": user_prompt,
+                    "model": model,
+                    "reasoning_effort": reasoning_effort,
+                    "verbosity": verbosity,
+                    "max_tokens": max_tokens,
+                }
+            )
+            if "模型档位路由器" in system_prompt:
+                assert '"allowed_tiers": ["low", "mini_high", "medium", "high"]' in user_prompt
+                return {"tier": "mini_high", "reasoning": "technical planning", "confidence": 0.88}
+            return {
+                "decision": "has_needs",
+                "retrieval_policy": "single",
+                "info_needs": [{"kind": "latest_spec", "question": "查 Fiber API", "required": False}],
+                "reasoning": "needs public retrieval",
+            }
+
+        state = _make_state(
+            user_message={"content": "Fiber WASM 怎么存数据？"},
+            _provider_registry=registry,
+        )
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm_json", mock_call_llm_json):
+            out = info_gap_assessor(state)
+
+        assert out["_route_decision"] == "has_needs"
+        assert calls[0]["model"] == "openai/gpt-5.4-mini"
+        assert calls[0]["reasoning_effort"] == "low"
+        assert calls[1]["model"] == "openai/gpt-5.4-mini"
+        assert calls[1]["reasoning_effort"] == "high"
+        assert out["_llm_trace"][0]["selected_tier"] == "mini_high"
+        assert out["_llm_trace"][1]["tier"] == "mini_high"
+
+    def test_info_gap_router_failure_falls_back_to_mini_high(self):
+        from nervos_brain.graph_engine.full_nodes import info_gap_assessor
+        from nervos_brain.graph_engine.provider_registry import ModelProfile, ProviderCapabilityRegistry
+
+        registry = ProviderCapabilityRegistry(
+            profiles={
+                "router": ModelProfile("router", "openai/gpt-5.4-mini", "low", "low", 512),
+                "low": ModelProfile("low", "openai/gpt-5.4-mini", "low", "low", 2048),
+                "mini_high": ModelProfile("mini_high", "openai/gpt-5.4-mini", "high", "low", 2048),
+                "medium": ModelProfile("medium", "openai/gpt-5.5", "low", "low", 2048),
+                "high": ModelProfile("high", "openai/gpt-5.5", "high", "low", 4096),
+            }
+        )
+        business_calls: list[dict] = []
+
+        def mock_call_llm_json(system_prompt, user_prompt, *, model=None, reasoning_effort=None, verbosity=None, max_tokens=None):
+            _ = user_prompt, verbosity, max_tokens
+            if "模型档位路由器" in system_prompt:
+                raise RuntimeError("router down")
+            business_calls.append({"model": model, "reasoning_effort": reasoning_effort})
+            return {
+                "decision": "has_needs",
+                "retrieval_policy": "single",
+                "info_needs": [{"kind": "latest_spec", "question": "查 Fiber API", "required": False}],
+            }
+
+        state = _make_state(
+            user_message={"content": "Fiber WASM 怎么存数据？"},
+            _provider_registry=registry,
+        )
+
+        with patch("nervos_brain.graph_engine.full_nodes.call_llm_json", mock_call_llm_json):
+            out = info_gap_assessor(state)
+
+        assert out["_route_decision"] == "has_needs"
+        assert business_calls == [{"model": "openai/gpt-5.4-mini", "reasoning_effort": "high"}]
+        assert out["_llm_trace"][0]["selected_tier"] == "mini_high"
+        assert out["_llm_trace"][1]["tier"] == "mini_high"
+
     def test_answer_composer_uses_router_selected_high_profile(self):
         from nervos_brain.graph_engine.full_nodes import answer_composer
         from nervos_brain.graph_engine.provider_registry import ModelProfile, ProviderCapabilityRegistry
@@ -1579,6 +1952,7 @@ class TestNodeModelRouter:
             profiles={
                 "router": ModelProfile("router", "openai/gpt-5.4-mini", "low", "low", 512),
                 "low": ModelProfile("low", "openai/gpt-5.4-mini", "low", "low", 2048),
+                "mini_high": ModelProfile("mini_high", "openai/gpt-5.4-mini", "high", "low", 2048),
                 "medium": ModelProfile("medium", "openai/gpt-5.5", "low", "low", 2048),
                 "high": ModelProfile("high", "openai/gpt-5.5", "high", "low", 4096),
             }
@@ -1658,6 +2032,7 @@ class TestNodeModelRouter:
             profiles={
                 "router": ModelProfile("router", "openai/gpt-5.4-mini", "low", "low", 512),
                 "low": ModelProfile("low", "openai/gpt-5.4-mini", "low", "low", 2048),
+                "mini_high": ModelProfile("mini_high", "openai/gpt-5.4-mini", "high", "low", 2048),
                 "medium": ModelProfile("medium", "openai/gpt-5.5", "low", "low", 2048),
                 "high": ModelProfile("high", "openai/gpt-5.5", "high", "low", 4096),
             }

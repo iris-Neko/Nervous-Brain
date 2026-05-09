@@ -1,5 +1,8 @@
+name: nervos-brain
+
 services:
   qdrant:
+    container_name: nervos-brain-qdrant
     image: qdrant/qdrant:v1.17.1
     restart: unless-stopped
     ports:

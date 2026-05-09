@@ -195,6 +195,10 @@ def test_build_runtime_defaults_to_dynamic_provider_registry(monkeypatch, tmp_pa
 
     assert isinstance(runtime.provider_registry, ProviderCapabilityRegistry)
     assert runtime.provider_registry.get_profile_for("general", tier="router")["tier"] == "router"
+    mini_high = runtime.provider_registry.get_profile_for("planning", tier="mini_high")
+    assert mini_high["tier"] == "mini_high"
+    assert mini_high["model"] == "openai/gpt-5.4-mini"
+    assert mini_high["reasoning_effort"] == "high"
 
 
 def test_build_runtime_model_argument_forces_fixed_registry(monkeypatch, tmp_path):
@@ -207,7 +211,7 @@ def test_build_runtime_model_argument_forces_fixed_registry(monkeypatch, tmp_pat
 
     runtime = runner._build_runtime(model="openai/gpt-5.5", memory_db=tmp_path / "memory.db")
 
-    profile = runtime.provider_registry.get_profile_for("reflection", tier="low")
+    profile = runtime.provider_registry.get_profile_for("reflection", tier="mini_high")
     assert profile["model"] == "openai/gpt-5.5"
     assert profile["reasoning_effort"] == ""
 

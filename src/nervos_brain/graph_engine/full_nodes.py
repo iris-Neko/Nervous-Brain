@@ -54,31 +54,37 @@ def _normalize_info_needs_schema(info_needs: Any) -> list[dict]:
 
 logger = logging.getLogger(__name__)
 
-_MODEL_TIERS = {"low", "medium", "high"}
+_MODEL_TIERS = {"low", "mini_high", "medium", "high"}
 _NODE_FALLBACK_TIERS = {
-    "info_gap_assessor": "low",
-    "retriever_planner": "low",
-    "reflection_pre": "low",
-    "reflection_post": "low",
+    "info_gap_assessor": "mini_high",
+    "retriever_planner": "mini_high",
+    "reflection_pre": "mini_high",
+    "reflection_post": "medium",
     "direct_answer": "low",
     "answer_composer": "medium",
 }
 _LLM_ROUTER_SYSTEM = """你是 Nervos Brain 的模型档位路由器。
-你的唯一任务是为当前 graph 节点选择 low、medium、high 三档之一。
+你的唯一任务是为当前 graph 节点选择 low、mini_high、medium、high 四档之一。
 只根据任务复杂度、风险和节点目标判断模型档位；不要改变 graph 路由、检索策略或回答内容。
 
 档位含义：
-- low: 简单判断、短直接回答、低风险格式/JSON 决策。
-- medium: 普通技术问答、查询计划、证据反思、需要稳定但不需要深推理。
-- high: 复杂代码生成、复杂架构方案、多证据综合、排障/错误日志、引用一致性高风险场景。
+- low: 只用于低风险、局部、可轻易判断的任务，例如闲聊、很短的直接回答、简单格式/JSON 分类、没有证据依赖的低成本节点。
+- mini_high: 低成本深思考档。用于技术分类、检索规划、info_gap 判断、轻量反思、引用初筛、公开资料缺口/版本差异判断。
+- medium: 默认强技术档。用于普通技术问答、最终回答生成、需要稳定综合但还不到深推理的节点。
+- high: 深推理档。用于源码/架构/协议实现问题、复杂代码生成、跨仓库/多后端证据综合、引用一致性高风险、证据与草稿明显不一致、排障/错误日志、安全/资金/私钥相关决策。
 
 选择约束：
-- reflection_pre 的常规任务通常选择 low 或 medium；不要因为“公开资料证据还不完整”就选 high。
-- 只有安全敏感决策、复杂架构权衡、真实错误日志排障、代码审计或多来源强冲突需要深推理时，才给 reflection_pre 选择 high。
-- 如果 time_budget 显示已超过目标耗时，应倾向选择能快速完成当前节点目标的最低可用档位。
+- 不要过度省模型。除非任务明显低风险且局部，技术类 graph 节点应至少选择 mini_high，而不是 low。
+- info_gap_assessor / retriever_planner 遇到真实项目、API、仓库、版本、检索策略、多库选择、是否需要证据的问题，通常选 mini_high；涉及源码实现、架构或强冲突时升级到 medium/high。
+- reflection_pre 存在证据、引用、草稿、冲突或跨来源判断时，通常至少选 mini_high；reflection_post 直接影响最终质量，通常至少选 medium。
+- 如果反思节点要判断“证据是否真能支撑回答”“引用是否错配”“草稿是否把 A 项目证据泛化到 B 项目”“是否需要改写”，应优先选择 high。
+- answer_composer 遇到源码实现、架构解释、协议/钱包/资金流程、跨多证据综合、长答案或代码示例时，应优先选择 high。
+- direct_answer 只有在闲聊、帮助说明、简单概念解释时选 low；如果用户要求真实项目细节、具体实现、代码、API 或高风险建议，至少 mini_high。
+- 如果 time_budget 已超过目标耗时，但当前节点是最终回答或反思校验，不要为了省时降到 low；优先用 medium 快速给出稳妥结论，只有低风险局部任务才选 low。
+- high 可以更积极使用，但不要用于纯格式修复、短闲聊、已明确无需推理的简单节点。
 
 必须只输出 JSON：
-{"tier":"low|medium|high","reasoning":"一句话说明","confidence":0.0}
+{"tier":"low|mini_high|medium|high","reasoning":"一句话说明","confidence":0.0}
 """
 
 
@@ -545,8 +551,9 @@ def _coerce_profile(raw: Any, *, fallback_tier: str = "low") -> dict[str, Any]:
     if not isinstance(raw, dict):
         raw = {}
     tier = str(raw.get("tier", fallback_tier) or fallback_tier).strip().lower()
-    if tier not in {"router", "low", "medium", "high"}:
-        tier = fallback_tier if fallback_tier in {"router", "low", "medium", "high"} else "low"
+    allowed_tiers = {"router", "low", "mini_high", "medium", "high"}
+    if tier not in allowed_tiers:
+        tier = fallback_tier if fallback_tier in allowed_tiers else "low"
     return {
         "tier": tier,
         "model": str(raw.get("model", "") or ""),
@@ -690,7 +697,7 @@ def _select_model_profile(
         "flags": _router_context_flags(state, node_name=node_name),
         "time_budget": _time_budget_snapshot(state),
         "fallback_tier": fallback,
-        "allowed_tiers": ["low", "medium", "high"],
+        "allowed_tiers": ["low", "mini_high", "medium", "high"],
     }
 
     tier = fallback
@@ -961,30 +968,6 @@ def _looks_like_new_user_intent(text: str) -> bool:
     return any(marker in normalized for marker in markers)
 
 
-def _looks_like_response_quality_feedback(text: str) -> bool:
-    """Detect short feedback about the bot's previous answer, not a new search task."""
-    normalized = re.sub(r"\s+", "", str(text or "").lower())
-    if not normalized:
-        return False
-    markers = (
-        "回复错问题",
-        "答非所问",
-        "不是这个问题",
-        "不是问这个",
-        "你理解错了",
-        "理解错了",
-        "回答错了",
-        "回复错了",
-        "回错了",
-        "跑题了",
-        "没回答我的问题",
-        "不是我要问的",
-        "你是不是回复错",
-        "是不是回复错",
-    )
-    return any(marker in normalized for marker in markers)
-
-
 def _looks_like_checkpoint_answer(text: str, checkpoint: dict[str, object]) -> bool:
     normalized = re.sub(r"\s+", "", text.lower())
     if not normalized:
@@ -1197,19 +1180,6 @@ def info_gap_assessor(state: dict) -> dict:
     recent_messages = _load_recent_messages(state)
     conversation_context = _format_conversation_context(recent_messages)
 
-    if _looks_like_response_quality_feedback(raw_question):
-        if checkpoint is not None:
-            _complete_thread_checkpoint(state)
-        return {
-            "_route_decision": "answer_direct",
-            "retrieval_policy": "none",
-            "info_needs": [],
-            "memory_facts": facts,
-            "recent_messages": recent_messages,
-            "conversation_context": conversation_context,
-            "resolved_question": raw_question,
-            "budget": _merge_policy_budget(state, "none"),
-        }
 
     user_prompt = prompts.INFO_GAP_USER.format(
         question=question,
@@ -1237,7 +1207,6 @@ def info_gap_assessor(state: dict) -> dict:
         "planning",
         node_name="info_gap_assessor",
         require_json=True,
-        fallback_tier="low",
     )
     try:
         result = _call_llm_json_with_profile(
@@ -1262,7 +1231,6 @@ def info_gap_assessor(state: dict) -> dict:
     info_needs = _normalize_info_needs_schema(result.get("info_needs", []))
     if decision == "ask_user" and not _required_questions(info_needs):
         decision = "has_needs" if info_needs else "answer_direct"
-
     retrieval_policy = _normalize_retrieval_policy(
         result.get("retrieval_policy"),
         decision=decision,
@@ -1356,7 +1324,6 @@ def retriever_planner(state: dict) -> dict:
         "planning",
         node_name="retriever_planner",
         require_json=True,
-        fallback_tier="low",
     )
     planner_system_prompt = (
         prompts.RETRIEVER_PLANNER_SYSTEM
@@ -1510,6 +1477,16 @@ def retrieval_executor(state: dict) -> dict:
         query = str(step.get("query", ""))
         raw_filters = step.get("filters", {}) if isinstance(step.get("filters", {}), dict) else {}
         filters, filter_notes = normalize_tool_filters(str(tool), raw_filters)
+        step_filter_notes = step.get("filter_notes", [])
+        if isinstance(step_filter_notes, list):
+            for note in step_filter_notes:
+                note_text = str(note).strip()
+                if note_text and note_text not in filter_notes:
+                    filter_notes.append(note_text)
+        elif step_filter_notes:
+            note_text = str(step_filter_notes).strip()
+            if note_text and note_text not in filter_notes:
+                filter_notes.append(note_text)
         top_k = step.get("top_k", 5)
         try:
             top_k = int(top_k)
@@ -1985,7 +1962,6 @@ def _reflect(state: dict, *, stage: str) -> dict[str, Any]:
         "reflection",
         node_name=node_name,
         require_json=True,
-        fallback_tier="low",
     )
     try:
         raw_result = _call_llm_json_with_profile(
@@ -2532,4 +2508,3 @@ def ask_user(state: dict) -> dict:
     if guard_reason:
         update["_ask_user_guard_reason"] = guard_reason
     return update
-

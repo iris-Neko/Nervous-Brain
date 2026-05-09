@@ -12,6 +12,10 @@ import abc
 import re
 from typing import Any
 
+from telegramify_markdown import convert as telegramify_convert
+from telegramify_markdown import split_entities as telegramify_split_entities
+from telegramify_markdown import utf16_len as telegramify_utf16_len
+
 from nervos_brain.core_protocols.common import Platform, RenderMode
 from nervos_brain.core_protocols.message_protocols import (
     ConversationContext,
@@ -80,24 +84,11 @@ class PlatformFormatter(abc.ABC):
         )
 
         caps = self.capabilities(render_mode=render_mode)
-        raw_chunks = chunk_for_platform(body, max_chars=caps["max_chars_per_segment"])
-        chunks = _enforce_segment_limit(
-            raw_chunks,
-            max_segments=caps["max_segments"],
-            max_chars=caps["max_chars_per_segment"],
+        segments = self._build_segments(
+            request_id=request_id,
+            body=body,
+            caps=caps,
         )
-
-        segments: list[OutboundMessageSegment] = []
-        for idx, chunk in enumerate(chunks):
-            segments.append(
-                {
-                    "segment_id": f"{request_id}:{idx}",
-                    "index": idx,
-                    "text": chunk,
-                    "char_count": len(chunk),
-                    "citation_labels": _extract_citation_labels(chunk),
-                }
-            )
 
         outbound: OutboundMessage = {
             "request_id": request_id,
@@ -113,6 +104,28 @@ class PlatformFormatter(abc.ABC):
     @abc.abstractmethod
     def _transform_markdown(self, text: str) -> str:
         """Convert standard markdown into platform-safe markdown."""
+
+    def _build_segments(
+        self,
+        *,
+        request_id: str,
+        body: Any,
+        caps: PlatformCapabilities,
+    ) -> list[OutboundMessageSegment]:
+        raw_chunks = chunk_for_platform(str(body), max_chars=caps["max_chars_per_segment"])
+        chunks = _enforce_segment_limit(
+            raw_chunks,
+            max_segments=caps["max_segments"],
+            max_chars=caps["max_chars_per_segment"],
+        )
+        return [
+            _build_segment(
+                request_id=request_id,
+                idx=idx,
+                text=chunk,
+            )
+            for idx, chunk in enumerate(chunks)
+        ]
 
     @staticmethod
     def _to_plain_text(text: str) -> str:
@@ -140,9 +153,51 @@ class TelegramFormatter(PlatformFormatter):
     def platform(self) -> Platform:
         return "telegram"
 
-    def _transform_markdown(self, text: str) -> str:
-        # Convert common Markdown into Telegram MarkdownV2, then escape unsafe text.
-        return _standard_markdown_to_telegram_markdown_v2(text.strip())
+    def _transform_markdown(self, text: str) -> tuple[str, list[Any]]:
+        # Telegram entity payloads avoid MarkdownV2 escaping and split safely across code blocks.
+        return telegramify_convert(text.strip())
+
+    def _build_segments(
+        self,
+        *,
+        request_id: str,
+        body: Any,
+        caps: PlatformCapabilities,
+    ) -> list[OutboundMessageSegment]:
+        if not isinstance(body, tuple) or len(body) != 2:
+            return super()._build_segments(request_id=request_id, body=body, caps=caps)
+
+        text, entities = body
+        split_chunks = telegramify_split_entities(
+            str(text),
+            list(entities or []),
+            max_utf16_len=caps["max_chars_per_segment"],
+        )
+        split_chunks = _enforce_telegram_segment_limit(
+            split_chunks,
+            max_segments=caps["max_segments"],
+            max_utf16_len=caps["max_chars_per_segment"],
+        )
+        if not split_chunks:
+            split_chunks = [("", [])]
+
+        segments: list[OutboundMessageSegment] = []
+        for idx, (chunk_text, chunk_entities) in enumerate(split_chunks):
+            segment = _build_segment(
+                request_id=request_id,
+                idx=idx,
+                text=chunk_text,
+                char_count=telegramify_utf16_len(chunk_text),
+            )
+            segment["parse_mode_enabled"] = False
+            entity_dicts = [
+                entity.to_dict() if hasattr(entity, "to_dict") else dict(entity)
+                for entity in (chunk_entities or [])
+            ]
+            if entity_dicts:
+                segment["entities"] = entity_dicts
+            segments.append(segment)
+        return segments
 
 
 def format_response_to_outbound(
@@ -201,6 +256,82 @@ def _enforce_segment_limit(
         return result
     result[-1] = last[:remaining] + suffix
     return result
+
+
+def _build_segment(
+    *,
+    request_id: str,
+    idx: int,
+    text: str,
+    char_count: int | None = None,
+) -> OutboundMessageSegment:
+    return {
+        "segment_id": f"{request_id}:{idx}",
+        "index": idx,
+        "text": text,
+        "char_count": len(text) if char_count is None else int(char_count),
+        "citation_labels": _extract_citation_labels(text),
+    }
+
+
+def _enforce_telegram_segment_limit(
+    chunks: list[tuple[str, list[Any]]],
+    *,
+    max_segments: int,
+    max_utf16_len: int,
+) -> list[tuple[str, list[Any]]]:
+    if len(chunks) <= max_segments:
+        return chunks
+
+    suffix = "\n\n[truncated]"
+    suffix_len = telegramify_utf16_len(suffix)
+    result = chunks[:max_segments]
+    last_text, last_entities = result[-1]
+    remaining = max_utf16_len - suffix_len
+    if remaining < 1:
+        result[-1] = (_truncate_to_utf16_len(suffix, max_utf16_len), [])
+        return result
+
+    clipped_text = _truncate_to_utf16_len(last_text, remaining)
+    clipped_len = telegramify_utf16_len(clipped_text)
+    result[-1] = (
+        clipped_text + suffix,
+        _clip_telegram_entities(last_entities, max_utf16_len=clipped_len),
+    )
+    return result
+
+
+def _truncate_to_utf16_len(text: str, max_utf16_len: int) -> str:
+    if telegramify_utf16_len(text) <= max_utf16_len:
+        return text
+
+    out: list[str] = []
+    total = 0
+    for char in text:
+        char_len = telegramify_utf16_len(char)
+        if total + char_len > max_utf16_len:
+            break
+        out.append(char)
+        total += char_len
+    return "".join(out)
+
+
+def _clip_telegram_entities(
+    entities: list[Any],
+    *,
+    max_utf16_len: int,
+) -> list[dict[str, Any]]:
+    clipped: list[dict[str, Any]] = []
+    for entity in entities or []:
+        entity_dict = entity.to_dict() if hasattr(entity, "to_dict") else dict(entity)
+        offset = int(entity_dict.get("offset", 0))
+        length = int(entity_dict.get("length", 0))
+        if offset >= max_utf16_len or length <= 0:
+            continue
+        if offset + length > max_utf16_len:
+            entity_dict["length"] = max_utf16_len - offset
+        clipped.append(entity_dict)
+    return clipped
 
 
 def _escape_non_code_md_v2(text: str) -> str:

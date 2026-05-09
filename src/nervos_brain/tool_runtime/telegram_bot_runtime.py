@@ -124,11 +124,11 @@ class TelegramBotAPI:
             detail = _redact_telegram_error(str(exc), self._cfg.bot_token)
             raise TelegramBotRuntimeError(
                 f"Telegram Bot API request failed for `{method}`: {detail}"
-            ) from exc
+            ) from None
         except ValueError as exc:
             raise TelegramBotRuntimeError(
                 f"Telegram Bot API returned non-JSON response for `{method}`."
-            ) from exc
+            ) from None
 
         if not isinstance(body, dict):
             raise TelegramBotRuntimeError(
@@ -199,7 +199,7 @@ class TelegramBotAPI:
                 return resp.content
         except requests.RequestException as exc:
             detail = _redact_telegram_error(str(exc), self._cfg.bot_token)
-            raise TelegramBotRuntimeError(f"Telegram file download failed: {detail}") from exc
+            raise TelegramBotRuntimeError(f"Telegram file download failed: {detail}") from None
 
     def send_chat_action(
         self,
@@ -238,9 +238,10 @@ class TelegramBotAPI:
                 raise
             fallback_payload = dict(payload)
             fallback_payload.pop("parse_mode", None)
+            fallback_payload.pop("entities", None)
             if fallback_payload != payload:
                 try:
-                    logger.warning("Telegram sendMessage failed with parse_mode; retrying as plain text.")
+                    logger.warning("Telegram sendMessage failed with rich formatting; retrying as plain text.")
                     return self.send_request(method=method, payload=fallback_payload)
                 except TelegramBotRuntimeError:
                     pass
@@ -773,8 +774,12 @@ class TelegramPollingGateway:
         state: dict[str, Any],
         envelope: dict[str, Any],
     ) -> None:
+        reply_context = _reply_context_from_envelope(envelope)
         svc = self._memory_service
         if svc is None or not hasattr(svc, "list_recent_message_events"):
+            if reply_context:
+                state["recent_messages"] = []
+                state["conversation_context"] = reply_context
             return
         context = envelope.get("context", {})
         if not isinstance(context, dict):
@@ -801,7 +806,11 @@ class TelegramPollingGateway:
             return
         if isinstance(rows, list):
             state["recent_messages"] = rows
-            state["conversation_context"] = _format_recent_messages(rows)
+            recent_context = _format_recent_messages(rows)
+            if reply_context and recent_context:
+                state["conversation_context"] = f"{reply_context}\n{recent_context}"
+            else:
+                state["conversation_context"] = reply_context or recent_context
 
     def _write_memory_event(
         self,
@@ -1041,8 +1050,10 @@ class TelegramPollingGateway:
                 "reflection_reasoning": str(result.get("reflection_reasoning") or state.get("reflection_reasoning") or "")[:500],
                 "info_needs": _debug_info_needs(result.get("info_needs") or state.get("info_needs")),
                 "tool_summary": str(result.get("_tool_execution_summary") or state.get("_tool_execution_summary") or ""),
+                "tool_trace": _debug_tool_trace(result.get("_tool_execution_trace") or state.get("_tool_execution_trace")),
                 "tool_calls": _infer_tool_calls(result=result, state=state),
                 "evidence_count": _infer_evidence_count(result=result, state=state, response=response),
+                "evidence_sources": _debug_evidence_sources(result.get("evidence") or state.get("evidence")),
                 "citation_count": len(response.get("citations", [])) if isinstance(response.get("citations"), list) else 0,
                 "graph_elapsed_ms": _int_like(result.get("_graph_elapsed_ms", 0)),
                 "node_timings": _debug_node_timings(result.get("_node_timings") or state.get("_node_timings")),
@@ -1347,6 +1358,22 @@ def _format_recent_messages(rows: list[Any], limit_chars: int = 1800) -> str:
     return text
 
 
+def _reply_context_from_envelope(envelope: dict[str, Any]) -> str:
+    reply_text = re.sub(r"\s+", " ", str(envelope.get("reply_to_content", "") or "")).strip()
+    if not reply_text:
+        return ""
+    if len(reply_text) > 700:
+        reply_text = reply_text[:700].rstrip() + "..."
+    role = str(envelope.get("reply_to_role", "") or "").strip().lower()
+    if role in {"assistant", "bot"}:
+        label = "assistant"
+    elif role == "user":
+        label = "user"
+    else:
+        label = "replied_message"
+    return f"当前消息正在回复这条 {label} 消息: {reply_text}"
+
+
 def _normalized_message_text(text: Any) -> str:
     return re.sub(r"\s+", "", str(text or "").lower())
 
@@ -1435,6 +1462,8 @@ def _looks_like_short_followup(text: str) -> bool:
 
 def _should_attach_recent_context(envelope: dict[str, Any]) -> bool:
     """Only inject same-user history when the current turn actually depends on it."""
+    if envelope.get("reply_to_message_id"):
+        return True
     text = str(envelope.get("content", "") or "")
     if _is_standalone_named_question(text):
         return False
@@ -1507,6 +1536,51 @@ def _debug_info_needs(value: Any) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def _debug_tool_trace(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in value[-20:]:
+        if not isinstance(item, dict):
+            continue
+        row: dict[str, Any] = {
+            "step_id": str(item.get("step_id", "")),
+            "tool": str(item.get("tool", "")),
+            "status": str(item.get("status", "")),
+            "evidence_count": _int_like(item.get("evidence_count", 0)),
+        }
+        for key in ("error_code", "fallback_reason"):
+            value_text = str(item.get(key, "") or "").strip()
+            if value_text:
+                row[key] = value_text[:160]
+        filter_notes = item.get("filter_notes")
+        if isinstance(filter_notes, list):
+            row["filter_notes"] = [str(note)[:160] for note in filter_notes[:8]]
+        rows.append(row)
+    return rows
+
+
+def _debug_evidence_sources(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    counts: dict[tuple[str, str], int] = {}
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        payload = item.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        source = str(payload.get("source") or item.get("source") or "")
+        backend = str(payload.get("backend") or "")
+        key = (source, backend)
+        counts[key] = counts.get(key, 0) + 1
+    rows = [
+        {"source": source, "backend": backend, "count": count}
+        for (source, backend), count in sorted(counts.items(), key=lambda row: (-row[1], row[0]))
+    ]
+    return rows[:12]
 
 
 def _debug_node_timings(value: Any) -> list[dict[str, Any]]:
@@ -1796,4 +1870,3 @@ def _build_outbound_from_graph_result(
         }
     ]
     return out
-

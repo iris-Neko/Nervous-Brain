@@ -1,4 +1,4 @@
-from typing import List, Literal, NotRequired, TypedDict
+from typing import Any, List, Literal, NotRequired, TypedDict
 
 from .common import MessageKind
 from .common import Platform
@@ -63,6 +63,12 @@ class MessageEnvelope(TypedDict):
 
     # 如果这是对某条消息的回复，就记录被回复消息的 ID
     reply_to_message_id: NotRequired[str]
+
+    # 被回复消息的简短内容快照，用于 Telegram/Discord follow-up 消歧
+    reply_to_content: NotRequired[str]
+
+    # 被回复消息的发送者角色，例如 user / assistant / bot
+    reply_to_role: NotRequired[str]
 
     # 附件列表，可选
     attachments: NotRequired[List[Attachment]]
@@ -140,6 +146,12 @@ class OutboundMessageSegment(TypedDict):
 
     # 这一段中出现了哪些引用编号
     citation_labels: List[str]
+
+    # 平台特定的发送实体，例如 Telegram MessageEntity
+    entities: NotRequired[List[dict[str, Any]]]
+
+    # 如果为 false，即使 render_mode=markdown 也不要使用 parse_mode。
+    parse_mode_enabled: NotRequired[bool]
 
 
 # 最终发往平台的消息结构
