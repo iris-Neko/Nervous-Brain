@@ -15,7 +15,9 @@ dependencies = [
   "rank-bm25>=0.2.2",
   "requests>=2.31.0",
   "discord.py>=2.4.0",
+  "mcp>=1.27.1,<2",
   "telegramify-markdown>=1.1.4,<2",
+  "markdown-it-py>=4.0.0",
 ]
 
 # 这是给咱们的质检机器人 pytest 专门看的地图
