@@ -1,279 +1,118 @@
 # Nervos Brain
 
-Nervos Brain is a CKB/Nervos-focused Agentic RAG bot for Telegram and Discord.
-It combines official documentation, Nervos Talk/forum discussions, and GitHub
-source code into a multi-backend retrieval runtime backed by SQLite archives,
-Qdrant vector indexes, and LangGraph answer generation.
+Nervos Brain 是面向 CKB/Nervos 的 Telegram / Discord Agentic RAG Bot。它把官方文档、Nervos Talk 论坛讨论和 GitHub 源码资料接入统一检索流程，并通过 LangGraph 完成信息缺口判断、检索规划、证据合并、回答生成、反思检查和平台格式化。
 
-## What Is Included
+默认部署目标是 Linux + `mamba` + Docker Qdrant server + Telegram/Discord Bot runtime。
 
-- Telegram and Discord online bot runtimes.
-- Multi-step graph workflow for clarification, retrieval planning, tool calls,
-  answer generation, self-checking, and platform formatting.
-- Three retrieval corpora:
-  - `retrieval`: official docs/GitHub documentation.
-  - `retrieval_forum_talk`: Nervos Talk/community discussions.
-  - `retrieval_github_code`: Nervos-related GitHub source code.
-- Dual-layer storage:
-  - SQLite archive DBs store full source text and metadata.
-  - Qdrant stores shallow vector payloads for fast retrieval.
-  - JSONL source exports preserve raw crawl output where available.
-- GitHub code crawler for public Nervos-related repositories.
-- Qdrant server mode for running Telegram and Discord as separate processes
-  without Qdrant local directory lock conflicts.
-
-## Clone With Data
-
-The GitHub source-code database artifacts are stored with Git LFS. Install Git
-LFS before cloning or pull LFS objects after cloning:
+## 快速部署
 
 ```bash
 git lfs install
 git clone https://github.com/iris-Neko/Nervos-Brain.git
 cd Nervos-Brain
-git checkout dev
+git checkout dev  # 当前交付/部署分支
 git lfs pull
-```
 
-LFS-tracked code corpus artifacts:
-
-```text
-data/github_code/archive.db
-data/qdrant_github_code/collection/nervos_github_code/storage.sqlite
-data/qdrant_github_code/meta.json
-data/sources/github_code.jsonl
-```
-
-The current GitHub code corpus contains `23247` records across `175` repositories.
-The local artifact size is roughly `334M`.
-
-## Environment
-
-Create the Python environment:
-
-```bash
 mamba env create -f environment.yml
-```
-
-Run commands through the environment:
-
-```bash
-mamba run -n nervos-brain python -m pytest -q
-```
-
-The project uses a `src/` layout. Tests are configured to import from `src`
-without requiring `pip install -e .`.
-
-## Configuration
-
-Copy the template and fill in local secrets:
-
-```bash
+# 如果环境已存在，改用：
+# mamba env update -n nervos-brain -f environment.yml --prune
 cp config.yaml.example config.yaml
 ```
 
-Do not commit `config.yaml`. It may contain LLM API keys, Telegram tokens, or
-Discord tokens. Runtime path handling is centralized in
-`src/nervos_brain/pathing.py`, and relative paths are resolved from the project
-root.
-
-Important environment variables:
+编辑 `config.yaml` 或通过环境变量填写本地密钥。最低必填项是 LLM API 配置，以及要启动的平台 Bot token：
 
 ```bash
-TELEGRAM_BOT_TOKEN=...
-DISCORD_BOT_TOKEN=...
-NERVOS_BRAIN_CONFIG=/optional/path/to/config.yaml
+export TELEGRAM_BOT_TOKEN="<TELEGRAM_BOT_TOKEN>"
+export DISCORD_BOT_TOKEN="<DISCORD_BOT_TOKEN>"
 ```
 
-## Qdrant Server Mode
-
-For deployment, use Qdrant server mode so Telegram and Discord can run as
-separate processes and share the same vector service:
-
-```bash
-docker compose -f docker-compose.qdrant.yml up -d
-curl http://127.0.0.1:6333/
-```
-
-The compose file binds Qdrant to localhost only:
-
-```text
-127.0.0.1:6333
-```
-
-Rebuild server collections from SQLite archives:
-
-```bash
-mamba run -n nervos-brain python scripts/migrate_qdrant_server_from_archive.py \
-  --public-default-backends \
-  --recreate
-```
-
-Fresh clone bootstrap:
+启动 Docker Qdrant 并从 SQLite archive 重建三套 collection：
 
 ```bash
 bash bootstrap_qdrant_server.sh
 ```
 
-`config.yaml.example` defaults to:
-
-```yaml
-retrieval:
-  qdrant_url: "http://127.0.0.1:6333"
-```
-
-Clear `qdrant_url` to fall back to local Qdrant directory mode using
-`qdrant_path`.
-
-`data/qdrant_server/` is Docker's runtime storage and is intentionally ignored.
-Do not commit that directory. The portable source of truth is the tracked
-SQLite archive DBs plus the rebuild command above; after `git lfs pull`, a new
-machine can recreate the Docker Qdrant collections from those archives.
-
-## Retrieval Data Layout
-
-Main data paths:
-
-```text
-data/archive.db                                      # docs archive
-data/forum_talk/archive.db                           # forum archive
-data/github_code/archive.db                          # source-code archive
-data/qdrant_local/                                   # docs local Qdrant fallback
-data/qdrant_talk_forum/                              # forum local Qdrant fallback
-data/qdrant_github_code/                             # source-code local Qdrant fallback
-data/sources/github_docs.jsonl                       # docs source export
-data/sources/github_code.jsonl                       # code source export
-```
-
-Runtime-private data is intentionally ignored:
-
-```text
-data/logs/
-data/telegram_bot/
-data/discord_bot/
-data/tmp/
-data/qdrant_server/
-```
-
-## Rebuild GitHub Code Corpus
-
-To recrawl the GitHub source-code corpus, use a GitHub token to avoid rate
-limits:
+启动 Telegram Bot：
 
 ```bash
-export GITHUB_TOKEN="..."
-```
-
-Dry-run crawl to JSONL:
-
-```bash
-mamba run -n nervos-brain python scripts/run_github_code_ingest.py \
-  --github-token "$GITHUB_TOKEN" \
-  --no-ingest \
-  --jsonl-out data/sources/github_code.jsonl
-```
-
-Full ingest:
-
-```bash
-mamba run -n nervos-brain python scripts/run_github_code_ingest.py \
-  --github-token "$GITHUB_TOKEN" \
-  --jsonl-out data/sources/github_code.jsonl
-```
-
-Default GitHub targets are public, non-archived repositories under:
-
-```text
-nervosnetwork
-web5fans
-ckb-devrel
-RGBPlusPlus
-appfi5
-```
-
-`RGBPlusPlus` is treated specially during corpus construction because its
-repositories may be forks but are still part of the requested source set.
-
-## Run The Bots
-
-Telegram polling runtime:
-
-```bash
-export TELEGRAM_BOT_TOKEN="..."
 bash restart_telegram_bot.sh
 ```
 
-Or run directly:
+启动 Discord Bot：
 
 ```bash
-mamba run -n nervos-brain python scripts/run_telegram_bot_polling.py
-```
-
-Discord runtime:
-
-```bash
-export DISCORD_BOT_TOKEN="..."
 mamba run -n nervos-brain python scripts/run_discord_bot.py
 ```
 
-Telegram supports concurrent update workers through `telegram_bot.max_worker_threads`.
-Discord uses `discord_bot.max_worker_threads`; messages in the same Discord
-channel stay ordered, while different channels can be processed concurrently.
+更完整的 fresh clone 部署流程见 [docs/deployment.md](docs/deployment.md)。
 
-## Architecture
+## 文档入口
 
-High-level runtime flow:
+- [工程文档索引](docs/README.md)
+- [新服务器部署](docs/deployment.md)
+- [配置说明](docs/configuration.md)
+- [检索数据与 Qdrant 重建](docs/retrieval-data.md)
+- [运行与运维](docs/runtime-operations.md)
+- [MCP 服务](docs/mcp.md)
+- [测试与验收](docs/testing-and-acceptance.md)
+- [故障排查](docs/troubleshooting.md)
 
-1. Telegram or Discord receives an update/message.
-2. A platform adapter converts it into a shared message envelope and graph state.
-3. The full graph assesses missing information, plans retrieval, executes tools,
-   merges evidence, composes an answer, self-checks, and formats output.
-4. The platform runtime sends message segments back to Telegram or Discord.
-5. Optional feedback/debug/memory data is written to local runtime paths.
+## 系统组成
 
-Retrieval flow:
+- `graph_engine`: full graph、prompt、模型路由、检索规划、回答生成和反思。
+- `tool_runtime`: Telegram/Discord runtime、平台 adapter、工具执行、反馈和 MCP transport。
+- `retrieval`: Qdrant 浅层向量库、SQLite archive 深层文本库、BM25/fuzzy/exact/vector 检索和多 backend 合并。
+- `ingestion`: GitHub docs/code、Discourse/Nervos Talk、JSONL/web text 数据入库。
+- `memory`: 用户/群/线程隔离的消息、事实和 AskUser checkpoint。
+- `response_normalizer`: 引用规范化、Markdown 清理、Telegram/Discord 分段格式化。
 
-1. Crawlers produce normalized `RawDocument` rows.
-2. `IngestionPipeline` writes documents through `DualLayerWriter`.
-3. `ArchiveStore` stores full raw text in SQLite.
-4. Qdrant stores compact vector payloads.
-5. `MultiRetriever` combines vector, BM25, fuzzy, and exact search.
-6. `CompositeRetriever` queries configured backends and merges evidence.
+## 检索数据
 
-## Tests
+当前公开部署使用三套检索 backend：
 
-Common checks:
-
-```bash
-mamba run -n nervos-brain python -m pytest -q
+```text
+retrieval              -> nervos_docs
+retrieval_forum_talk   -> nervos_talk_user_discussions
+retrieval_github_code  -> nervos_github_code
 ```
 
-Focused retrieval/Qdrant checks:
+SQLite archive DB 是可提交/可复现的数据源，Docker Qdrant server 是运行时向量服务。`data/qdrant_server/` 是 Docker 运行目录，不提交；新机器 clone 后通过 `bootstrap_qdrant_server.sh` 从 archive DB 重建 Qdrant collection。
+
+GitHub code corpus 相关大文件使用 Git LFS。fresh clone 后必须运行：
 
 ```bash
-mamba run -n nervos-brain python -m pytest -q \
-  tests/test_retrieval_unit.py \
-  tests/test_retrieval_advanced.py \
-  tests/test_composite_retriever.py \
-  tests/test_qdrant_server_migration.py
+git lfs pull
 ```
 
-Bot runtime checks:
+## 配置与安全边界
+
+`config.yaml.example` 是模板，`config.yaml` 是本地私有配置，不提交。公开仓库不包含：
+
+```text
+LLM API key
+Telegram / Discord Bot token
+config.yaml
+.env*
+群聊记录
+debug events
+feedback.jsonl
+memory DB
+runtime logs
+Docker Qdrant server 运行目录
+```
+
+配置里的路径应保持相对路径，运行时由 `src/nervos_brain/pathing.py` 解析。不要把本机绝对路径写进公开配置或文档。
+
+## 常用命令
 
 ```bash
-mamba run -n nervos-brain python -m pytest -q \
-  tests/test_telegram_bot_runtime.py \
-  tests/test_discord_bot_runtime.py
+bash -n bootstrap_qdrant_server.sh restart_telegram_bot.sh
+mamba run -n nervos-brain python -m py_compile \
+  scripts/migrate_qdrant_server_from_archive.py \
+  scripts/run_talk_mcp_server.py \
+  scripts/run_talk_forum_ingest.py
+# 全量测试较重，需要时再运行：
+# mamba run -n nervos-brain pytest -q
 ```
 
-## Security Notes
-
-Never commit:
-
-- `config.yaml`, `.env*`, API keys, Telegram bot tokens, Discord bot tokens.
-- Runtime logs, Telegram/Discord memory DBs, debug events, feedback files, and
-  attachment downloads.
-- Temporary crawler workspaces and local Qdrant server runtime storage.
-
-If a token is pasted into a chat, issue tracker, or commit by mistake, revoke it
-and create a new one.
+更多测试和验收命令见 [docs/testing-and-acceptance.md](docs/testing-and-acceptance.md)。
