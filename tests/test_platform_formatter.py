@@ -148,3 +148,28 @@ def test_capabilities_profile():
 
     assert discord_caps["max_chars_per_segment"] == 2000
     assert tg_caps["max_chars_per_segment"] == 4096
+
+
+def test_discord_long_code_block_splits_with_balanced_fences():
+    code = "\n".join(f"console.log({idx});" for idx in range(420))
+    response = _base_response(
+        "### Discord 长代码块\n"
+        "```ts\n"
+        f"{code}\n"
+        "```\n"
+        "结束 [1]"
+    )
+    context = {"platform": "discord", "user_id": "u1"}
+    outbound = format_response_to_outbound(
+        response=response,
+        context=context,
+        render_mode="markdown",
+    )
+
+    assert len(outbound["segments"]) > 1
+    assert all(seg["char_count"] <= 2000 for seg in outbound["segments"])
+    fenced_segments = [seg["text"] for seg in outbound["segments"] if "```" in seg["text"]]
+    assert fenced_segments
+    assert all(text.count("```") % 2 == 0 for text in fenced_segments)
+    assert any(text.startswith("```ts\n") and text.endswith("\n```") for text in fenced_segments)
+    assert "[1]" in outbound["segments"][-1]["citation_labels"]

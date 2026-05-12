@@ -53,6 +53,12 @@ def discord_message_to_message_envelope(
         ref_mid = reference.get("message_id")
         if ref_mid is not None:
             envelope["reply_to_message_id"] = str(ref_mid)
+        reply_text = _extract_reply_text(reference)
+        if reply_text:
+            envelope["reply_to_content"] = _truncate_reply_content(reply_text)
+        reply_author = reference.get("author")
+        if isinstance(reply_author, dict):
+            envelope["reply_to_role"] = "assistant" if bool(reply_author.get("bot")) else "user"
 
     attachments = _extract_attachments(message)
     if attachments:
@@ -135,11 +141,48 @@ def outbound_message_to_discord_requests(outbound: OutboundMessage) -> list[dict
         payload: dict[str, Any] = {
             "channel_id": str(channel_id),
             "content": str(segment.get("text", "")),
+            "allowed_mentions": {"parse": []},
         }
         if idx == 0 and reply_to:
             payload["reply_to_message_id"] = str(reply_to)
+        if outbound.get("append_csat") and idx == len(segments) - 1:
+            payload["components"] = _build_csat_components(str(outbound.get("request_id", "")))
         requests.append({"method": "create_message", "payload": payload})
     return requests
+
+
+def _extract_reply_text(reference: dict[str, Any]) -> str:
+    for key in ("content", "reply_to_content"):
+        value = reference.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    resolved = reference.get("resolved")
+    if isinstance(resolved, dict):
+        value = resolved.get("content")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _truncate_reply_content(text: str, limit: int = 700) -> str:
+    cleaned = " ".join(str(text or "").split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit].rstrip() + "..."
+
+
+def _build_csat_components(request_id: str) -> list[dict[str, Any]]:
+    buttons = []
+    for score in range(1, 6):
+        buttons.append(
+            {
+                "type": 2,
+                "style": 2,
+                "label": str(score),
+                "custom_id": f"csat:{request_id}:{score}",
+            }
+        )
+    return [{"type": 1, "components": buttons}]
 
 
 def _parse_command(text: str) -> tuple[str | None, str | None]:
@@ -178,13 +221,16 @@ def _extract_attachments(message: dict[str, Any]) -> list[dict[str, str]]:
                 continue
             ctype = str(item.get("content_type", "") or "")
             kind = "image" if ctype.startswith("image/") else "file"
-            out.append(
-                {
-                    "kind": kind,
-                    "url": url,
-                    "name": str(item.get("filename") or item.get("id") or "file"),
-                }
-            )
+            attachment = {
+                "kind": kind,
+                "url": url,
+                "name": str(item.get("filename") or item.get("id") or "file"),
+            }
+            if item.get("content_type") is not None:
+                attachment["mime_type"] = str(item.get("content_type") or "")
+            if item.get("size") is not None:
+                attachment["file_size"] = str(item.get("size") or "")
+            out.append(attachment)
 
     embeds = message.get("embeds")
     if isinstance(embeds, list):

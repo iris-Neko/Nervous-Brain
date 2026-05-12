@@ -126,3 +126,73 @@ def test_outbound_to_discord_requests_requires_channel():
 def test_discord_message_to_envelope_rejects_bad_payload():
     with pytest.raises(ValueError, match="payload must be dict"):
         discord_message_to_message_envelope("bad")  # type: ignore[arg-type]
+
+
+def test_discord_message_to_envelope_reply_snapshot_and_role():
+    payload = {
+        "id": "m-300",
+        "content": "接着解释",
+        "timestamp": "2024-03-22T10:11:12Z",
+        "author": {"id": "u-3"},
+        "channel_id": "c-3",
+        "guild_id": "g-3",
+        "reference": {
+            "message_id": "m-bot",
+            "content": "上一条 bot 回答里提到了 CCC transfer API。",
+            "author": {"id": "bot-1", "bot": True},
+        },
+    }
+
+    env = discord_message_to_message_envelope(payload)
+
+    assert env["reply_to_message_id"] == "m-bot"
+    assert env["reply_to_role"] == "assistant"
+    assert "CCC transfer API" in env["reply_to_content"]
+
+
+def test_discord_message_to_envelope_preserves_attachment_metadata():
+    payload = {
+        "id": "m-301",
+        "content": "看附件",
+        "timestamp": "2024-03-22T10:11:12Z",
+        "author": {"id": "u-3"},
+        "channel_id": "c-3",
+        "attachments": [
+            {
+                "id": "a-md",
+                "url": "https://example.com/readme.md",
+                "filename": "readme.md",
+                "content_type": "text/markdown",
+                "size": 1234,
+            }
+        ],
+    }
+
+    env = discord_message_to_message_envelope(payload)
+
+    attachment = env["attachments"][0]
+    assert attachment["name"] == "readme.md"
+    assert attachment["mime_type"] == "text/markdown"
+    assert attachment["file_size"] == "1234"
+
+
+def test_outbound_to_discord_requests_allowed_mentions_and_csat_buttons():
+    outbound = {
+        "request_id": "dc-csat",
+        "context": {"platform": "discord", "user_id": "u1", "channel_id": "c-1"},
+        "segments": [
+            {"segment_id": "dc-csat:0", "index": 0, "text": "part1", "char_count": 5, "citation_labels": []},
+            {"segment_id": "dc-csat:1", "index": 1, "text": "part2", "char_count": 5, "citation_labels": []},
+        ],
+        "render_mode": "markdown",
+        "append_csat": True,
+    }
+
+    reqs = outbound_message_to_discord_requests(outbound)
+
+    assert all(req["payload"]["allowed_mentions"] == {"parse": []} for req in reqs)
+    assert "components" not in reqs[0]["payload"]
+    buttons = reqs[1]["payload"]["components"][0]["components"]
+    assert len(buttons) == 5
+    assert buttons[0]["custom_id"] == "csat:dc-csat:1"
+    assert buttons[-1]["custom_id"] == "csat:dc-csat:5"

@@ -38,6 +38,12 @@ from .telegram_bot_runtime import (
     TelegramPollingGateway,
     TelegramUpdateOffsetStore,
 )
+from .talk_mcp_adapter import (
+    TalkMCPClient,
+    TalkMCPConfig,
+    TalkMCPError,
+    build_fastmcp_server as build_talk_fastmcp_server,
+)
 from .transport import MCPTransportAdapter, MockTransportAdapter, select_transport
 
 __all__ = [
@@ -73,6 +79,10 @@ __all__ = [
     "TelegramBotAPI",
     "TelegramUpdateOffsetStore",
     "TelegramPollingGateway",
+    "TalkMCPClient",
+    "TalkMCPConfig",
+    "TalkMCPError",
+    "build_talk_fastmcp_server",
     "MCPTransportAdapter",
     "MockTransportAdapter",
     "select_transport",

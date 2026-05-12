@@ -156,6 +156,15 @@ discord_bot:
   # 在线 Discord Bot 网关配置（真实收发）
   # token 建议放在环境变量 DISCORD_BOT_TOKEN，不要写入仓库
   memory_db: "data/discord_bot/memory.db"
+  feedback_file: "data/discord_bot/feedback.jsonl"
+  debug_log_file: "data/discord_bot/debug_events.jsonl"
   mention_only_in_guild: true
+  respond_to_bot_replies: true
+  append_csat: false
+  memory_context_limit: 20
   max_worker_threads: 4
-  model: "openai/gpt-5.4"
+  target_elapsed_ms: 30000
+  max_elapsed_ms: 90000
+  attachment_max_bytes: 262144
+  allowed_channel_ids: []
+  allowed_guild_ids: []

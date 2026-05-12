@@ -12,6 +12,7 @@ import abc
 import re
 from typing import Any
 
+from markdown_it import MarkdownIt
 from telegramify_markdown import convert as telegramify_convert
 from telegramify_markdown import split_entities as telegramify_split_entities
 from telegramify_markdown import utf16_len as telegramify_utf16_len
@@ -147,6 +148,27 @@ class DiscordFormatter(PlatformFormatter):
     def _transform_markdown(self, text: str) -> str:
         return text.strip()
 
+    def _build_segments(
+        self,
+        *,
+        request_id: str,
+        body: Any,
+        caps: PlatformCapabilities,
+    ) -> list[OutboundMessageSegment]:
+        chunks = _split_discord_markdown(
+            str(body),
+            max_chars=caps["max_chars_per_segment"],
+        )
+        chunks = _enforce_segment_limit(
+            chunks,
+            max_segments=caps["max_segments"],
+            max_chars=caps["max_chars_per_segment"],
+        )
+        return [
+            _build_segment(request_id=request_id, idx=idx, text=chunk)
+            for idx, chunk in enumerate(chunks)
+        ]
+
 
 class TelegramFormatter(PlatformFormatter):
     @property
@@ -227,6 +249,124 @@ def format_response_to_outbound(
         append_csat=append_csat,
         reply_to_message_id=reply_to_message_id,
     )
+
+
+def _split_discord_markdown(text: str, *, max_chars: int) -> list[str]:
+    """Split Discord Markdown without leaving fenced code blocks unbalanced."""
+    source = str(text or "").strip()
+    if not source:
+        return [""]
+
+    blocks = _discord_markdown_blocks(source)
+    chunks: list[str] = []
+    current = ""
+    for block in blocks:
+        for piece in _split_discord_block(block, max_chars=max_chars):
+            piece = piece.strip("\n")
+            if not piece:
+                continue
+            candidate = piece if not current else f"{current}\n\n{piece}"
+            if len(candidate) <= max_chars:
+                current = candidate
+                continue
+            if current:
+                chunks.append(current)
+            current = piece
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
+
+def _discord_markdown_blocks(text: str) -> list[str]:
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return [text]
+
+    fence_ranges: dict[int, int] = {}
+    try:
+        parser = MarkdownIt()
+        for token in parser.parse(text):
+            if token.type == "fence" and token.map:
+                start, end = token.map
+                fence_ranges[int(start)] = int(end)
+    except Exception:
+        fence_ranges = {}
+
+    blocks: list[str] = []
+    idx = 0
+    pending: list[str] = []
+    while idx < len(lines):
+        if idx in fence_ranges:
+            if pending:
+                blocks.append("".join(pending).strip("\n"))
+                pending = []
+            end = max(idx + 1, fence_ranges[idx])
+            blocks.append("".join(lines[idx:end]).strip("\n"))
+            idx = end
+            continue
+
+        line = lines[idx]
+        if not line.strip():
+            if pending:
+                blocks.append("".join(pending).strip("\n"))
+                pending = []
+        else:
+            pending.append(line)
+        idx += 1
+
+    if pending:
+        blocks.append("".join(pending).strip("\n"))
+    return [block for block in blocks if block]
+
+
+def _split_discord_block(block: str, *, max_chars: int) -> list[str]:
+    if len(block) <= max_chars:
+        return [block]
+    fence = _parse_fenced_code_block(block)
+    if fence is not None:
+        lang, code = fence
+        return _split_discord_code_block(lang=lang, code=code, max_chars=max_chars)
+    return chunk_for_platform(block, max_chars=max_chars)
+
+
+def _parse_fenced_code_block(block: str) -> tuple[str, str] | None:
+    text = block.strip("\n")
+    if not text.startswith("```"):
+        return None
+    lines = text.splitlines()
+    if len(lines) < 2 or not lines[-1].strip().startswith("```"):
+        return None
+    first = lines[0].strip()
+    lang = first[3:].strip().split()[0] if len(first) > 3 and first[3:].strip() else ""
+    code = "\n".join(lines[1:-1])
+    return lang, code
+
+
+def _split_discord_code_block(*, lang: str, code: str, max_chars: int) -> list[str]:
+    prefix = f"```{lang}\n" if lang else "```\n"
+    suffix = "\n```"
+    budget = max_chars - len(prefix) - len(suffix)
+    if budget < 20:
+        return chunk_for_platform(code, max_chars=max_chars)
+
+    pieces: list[str] = []
+    current = ""
+    for line in code.splitlines(keepends=True):
+        if len(line) > budget:
+            if current:
+                pieces.append(current.rstrip("\n"))
+                current = ""
+            for part in chunk_for_platform(line.rstrip("\n"), max_chars=budget):
+                pieces.append(part)
+            continue
+        if len(current) + len(line) > budget and current:
+            pieces.append(current.rstrip("\n"))
+            current = line
+        else:
+            current += line
+    if current:
+        pieces.append(current.rstrip("\n"))
+    return [f"{prefix}{piece}{suffix}" for piece in pieces if piece]
 
 
 def _extract_citation_labels(text: str) -> list[str]:
