@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Nervos Talk forum incremental ingest every 24 hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=24h
+Persistent=true
+Unit=nervos-talk-forum-ingest.service
+
+[Install]
+WantedBy=timers.target
