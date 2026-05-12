@@ -10,7 +10,7 @@
     "https://github.com/web5fans"
   ],
   "targets_hash": "f2818be74a8e2610",
-  "generated_ts_ms": 1778600035160,
+  "generated_ts_ms": 1778608032825,
   "repos": [
     {
       "repo": "appfi5/SupeRISE-for-agent",
@@ -893,6 +893,13 @@
       "commit": "1a0245da965e71fc7b706cb384275d753079c71a",
       "doc_count": 3,
       "updated_ts_ms": 1778597907436
+    },
+    {
+      "repo": "nervosnetwork/ncp-poc",
+      "branch": "main",
+      "commit": "895a0916b2f22d818a2bca26b3a24e60552ddf5d",
+      "doc_count": 46,
+      "updated_ts_ms": 1778608005670
     },
     {
       "repo": "nervosnetwork/nervos-bot",
