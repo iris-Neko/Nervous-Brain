@@ -2,3 +2,5 @@ data/github_code/archive.db filter=lfs diff=lfs merge=lfs -text
 data/qdrant_github_code/collection/nervos_github_code/storage.sqlite filter=lfs diff=lfs merge=lfs -text
 data/qdrant_github_code/meta.json filter=lfs diff=lfs merge=lfs -text
 data/sources/github_code.jsonl filter=lfs diff=lfs merge=lfs -text
+data/forum_talk/archive.db filter=lfs diff=lfs merge=lfs -text
+data/archive.db filter=lfs diff=lfs merge=lfs -text
