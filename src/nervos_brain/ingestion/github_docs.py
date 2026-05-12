@@ -230,6 +230,14 @@ class GitHubDocsCrawler(SourceCrawler):
             page += 1
         return repos
 
+    def fetch_repo_head_commit(self, repo: GitHubRepo) -> str:
+        """Return current default-branch commit SHA without cloning."""
+        data = self._api_get_json(f"/repos/{repo.owner}/{repo.name}/commits/{repo.default_branch}")
+        sha = str(data.get("sha") or "").strip()
+        if not sha:
+            raise RuntimeError(f"GitHub API returned no head sha for {repo.full_name}")
+        return sha
+
     def _api_get_json(self, path: str, params: dict | None = None):
         elapsed = time.monotonic() - self._last_request_ts
         if elapsed < self._request_delay:
@@ -409,4 +417,3 @@ class GitHubDocsCrawler(SourceCrawler):
             seen.add(token)
             unique.append(token)
         return ",".join(unique)
-

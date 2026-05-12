@@ -2,7 +2,6 @@
 .DS_Store
 .codex
 .agent/
-docs/
 report/
 
 # Local secrets and machine-specific runtime config
@@ -28,6 +27,7 @@ data/telegram_bot/
 data/discord_bot/
 data/product_demo/
 data/tmp/
+data/ingest_state/
 data/tmp*.db
 data/qdrant_server/
 

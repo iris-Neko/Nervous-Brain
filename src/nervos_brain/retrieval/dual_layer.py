@@ -15,7 +15,7 @@ import uuid
 from pathlib import Path
 from typing import List, Optional
 
-from sqlalchemy import String, Text, create_engine, select
+from sqlalchemy import String, Text, create_engine, delete, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from .anchor_hash import build_stable_hash
@@ -134,6 +134,30 @@ class ArchiveStore:
             # detach from session before returning
             session.expunge_all()
             return list(rows)
+
+    def list_by_source_topic(self, *, source: str, topic: str) -> List[ArchiveRecord]:
+        """Return records for one source/topic pair."""
+        with self._factory() as session:
+            rows = session.scalars(
+                select(ArchiveRecord).where(
+                    ArchiveRecord.source == source,
+                    ArchiveRecord.topic == topic,
+                )
+            ).all()
+            session.expunge_all()
+            return list(rows)
+
+    def delete_by_hashes(self, hashes: list[str]) -> int:
+        """Delete archive records by content_hash and return deleted count."""
+        values = [str(value).strip() for value in hashes if str(value).strip()]
+        if not values:
+            return 0
+        with self._factory() as session:
+            result = session.execute(
+                delete(ArchiveRecord).where(ArchiveRecord.content_hash.in_(values))
+            )
+            session.commit()
+            return int(result.rowcount or 0)
 
     def count(self) -> int:
         with self._factory() as session:

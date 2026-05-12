@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Nervos GitHub docs/code incremental ingest weekly
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=1w
+Persistent=true
+Unit=nervos-github-ingest.service
+
+[Install]
+WantedBy=timers.target

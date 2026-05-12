@@ -85,6 +85,14 @@ class QdrantStore:
         self.client.upsert(collection_name=self.config.collection_name, points=points)
         return len(points)
 
+    def delete_by_hashes(self, hashes: List[str]) -> int:
+        """Delete Qdrant points whose stable IDs are derived from content hashes."""
+        ids = [str(uuid5(NAMESPACE_URL, str(value))) for value in hashes if str(value).strip()]
+        if not ids:
+            return 0
+        self.client.delete(collection_name=self.config.collection_name, points_selector=ids)
+        return len(ids)
+
 
 def _stable_point_id(text: str, payload: Dict[str, str]) -> str:
     stable_key = str(

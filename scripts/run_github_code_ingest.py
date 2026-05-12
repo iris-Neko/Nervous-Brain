@@ -21,7 +21,12 @@ import requests
 # Allow running from repo root without package install.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from nervos_brain.ingestion import GitHubCodeCrawler, IngestionPipeline, RawDocument
+from nervos_brain.ingestion import (
+    GitHubCodeCrawler,
+    IngestionPipeline,
+    RawDocument,
+    run_incremental_github_ingest,
+)
 from nervos_brain.retrieval import (
     ArchiveStore,
     MultiRetriever,
@@ -40,6 +45,11 @@ DEFAULT_TARGETS = [
     "https://github.com/nervosnetwork/fiber",
     "https://github.com/appfi5",
 ]
+
+DEFAULT_CORPUS = "github_code"
+DEFAULT_STATE_FILE = "data/ingest_state/github_code_state.json"
+DEFAULT_MANIFEST_OUT = "data/manifests/github_code_manifest.json"
+DEFAULT_INCREMENTAL_JSONL_OUT = "data/tmp/github_code_delta.jsonl"
 
 DEFAULT_CODE_ARCHIVE_DB = "data/github_code/archive.db"
 DEFAULT_CODE_QDRANT_PATH = "data/qdrant_github_code"
@@ -163,6 +173,10 @@ def main() -> None:
         default=2,
         help="Retry count for retryable git network failures.",
     )
+    parser.add_argument("--incremental", action="store_true", help="Only crawl repos whose default-branch commit changed.")
+    parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help="Local incremental state path.")
+    parser.add_argument("--manifest-out", default=DEFAULT_MANIFEST_OUT, help="Public commit manifest output path.")
+    parser.add_argument("--reset-state", action="store_true", help="Ignore existing incremental state.")
     parser.add_argument("--no-ingest", action="store_true", help="Only crawl + export JSONL; skip DB.")
     parser.add_argument("--dry-run", action="store_true", help="Parse only; skip DB writes.")
     parser.add_argument("--archive", default=None, help="Override archive db path.")
@@ -171,6 +185,9 @@ def main() -> None:
     args = parser.parse_args()
 
     targets = args.target or DEFAULT_TARGETS
+    if args.incremental and args.jsonl_out == "data/sources/github_code.jsonl":
+        args.jsonl_out = DEFAULT_INCREMENTAL_JSONL_OUT
+
     crawler = GitHubCodeCrawler(
         targets=targets,
         clone_workspace=args.clone_workspace,
@@ -188,6 +205,38 @@ def main() -> None:
 
     try:
         logger.info("GitHub code ingest targets=%s no_ingest=%s dry_run=%s", len(targets), args.no_ingest, args.dry_run)
+        cfg = _build_code_config(args)
+
+        if args.incremental:
+            dry_incremental = args.dry_run or args.no_ingest
+            writer = None if dry_incremental else _build_writer(cfg)
+            result = run_incremental_github_ingest(
+                corpus=DEFAULT_CORPUS,
+                targets=targets,
+                crawler=crawler,
+                writer=writer,
+                cfg=cfg,
+                state_file=args.state_file,
+                manifest_out=args.manifest_out,
+                jsonl_out=args.jsonl_out,
+                row_factory=_doc_to_row,
+                reset_state=args.reset_state,
+                dry_run=dry_incremental,
+            )
+            print("Incremental code ingest finished:")
+            print(f"  repos={result.repos}")
+            print(f"  changed_repos={result.changed_repos}")
+            print(f"  skipped_repos={result.skipped_repos}")
+            print(f"  seen={result.seen}")
+            print(f"  written={result.written}")
+            print(f"  cleaned={result.cleaned}")
+            print(f"  failed_repos={result.failed_repos}")
+            print(f"  state={args.state_file}")
+            print(f"  manifest={args.manifest_out}")
+            print(f"  jsonl={args.jsonl_out}")
+            print(f"  bm25_index_size={result.bm25_index_size}")
+            return
+
         if args.no_ingest:
             docs = 0
             for _ in export_crawler.crawl():
@@ -198,7 +247,6 @@ def main() -> None:
             print(f"  jsonl={args.jsonl_out}")
             return
 
-        cfg = _build_code_config(args)
         writer = _build_writer(cfg)
         pipeline = IngestionPipeline(writer)
         stats = pipeline.run(export_crawler, dry_run=args.dry_run)

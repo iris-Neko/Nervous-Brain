@@ -20,7 +20,12 @@ import requests
 # Allow running from repo root without package install.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from nervos_brain.ingestion import GitHubDocsCrawler, IngestionPipeline, RawDocument
+from nervos_brain.ingestion import (
+    GitHubDocsCrawler,
+    IngestionPipeline,
+    RawDocument,
+    run_incremental_github_ingest,
+)
 from nervos_brain.retrieval import (
     ArchiveStore,
     MultiRetriever,
@@ -29,6 +34,11 @@ from nervos_brain.retrieval import (
     load_retrieval_config,
 )
 from nervos_brain.retrieval.dual_layer import DualLayerWriter
+
+DEFAULT_CORPUS = "github_docs"
+DEFAULT_STATE_FILE = "data/ingest_state/github_docs_state.json"
+DEFAULT_MANIFEST_OUT = "data/manifests/github_docs_manifest.json"
+DEFAULT_INCREMENTAL_JSONL_OUT = "data/tmp/github_docs_delta.jsonl"
 
 DEFAULT_TARGETS = [
     "https://github.com/nervosnetwork",
@@ -121,6 +131,10 @@ def main() -> None:
         default=300_000,
         help="Skip files larger than this many bytes.",
     )
+    parser.add_argument("--incremental", action="store_true", help="Only crawl repos whose default-branch commit changed.")
+    parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help="Local incremental state path.")
+    parser.add_argument("--manifest-out", default=DEFAULT_MANIFEST_OUT, help="Public commit manifest output path.")
+    parser.add_argument("--reset-state", action="store_true", help="Ignore existing incremental state.")
     parser.add_argument("--no-ingest", action="store_true", help="Only crawl + export JSONL; skip DB.")
     parser.add_argument("--dry-run", action="store_true", help="Parse only; skip DB writes.")
     parser.add_argument("--archive", default=None, help="Override archive db path.")
@@ -128,6 +142,9 @@ def main() -> None:
     args = parser.parse_args()
 
     targets = args.target or DEFAULT_TARGETS
+    if args.incremental and args.jsonl_out == "data/sources/github_docs.jsonl":
+        args.jsonl_out = DEFAULT_INCREMENTAL_JSONL_OUT
+
     crawler = GitHubDocsCrawler(
         targets=targets,
         clone_workspace=args.clone_workspace,
@@ -142,6 +159,42 @@ def main() -> None:
     export_crawler = _JsonlExportCrawler(crawler, jsonl_path=args.jsonl_out)
 
     try:
+        cfg = load_retrieval_config()
+        if args.archive:
+            cfg = RetrievalConfig(**{**cfg.__dict__, "archive_db": args.archive})
+        if args.qdrant:
+            cfg = RetrievalConfig(**{**cfg.__dict__, "qdrant_path": args.qdrant})
+
+        if args.incremental:
+            dry_incremental = args.dry_run or args.no_ingest
+            writer = None if dry_incremental else _build_writer(cfg)
+            result = run_incremental_github_ingest(
+                corpus=DEFAULT_CORPUS,
+                targets=targets,
+                crawler=crawler,
+                writer=writer,
+                cfg=cfg,
+                state_file=args.state_file,
+                manifest_out=args.manifest_out,
+                jsonl_out=args.jsonl_out,
+                row_factory=_doc_to_row,
+                reset_state=args.reset_state,
+                dry_run=dry_incremental,
+            )
+            print("Incremental ingest finished:")
+            print(f"  repos={result.repos}")
+            print(f"  changed_repos={result.changed_repos}")
+            print(f"  skipped_repos={result.skipped_repos}")
+            print(f"  seen={result.seen}")
+            print(f"  written={result.written}")
+            print(f"  cleaned={result.cleaned}")
+            print(f"  failed_repos={result.failed_repos}")
+            print(f"  state={args.state_file}")
+            print(f"  manifest={args.manifest_out}")
+            print(f"  jsonl={args.jsonl_out}")
+            print(f"  bm25_index_size={result.bm25_index_size}")
+            return
+
         if args.no_ingest:
             docs = 0
             for _ in export_crawler.crawl():
@@ -151,12 +204,6 @@ def main() -> None:
             print(f"  docs={docs}")
             print(f"  jsonl={args.jsonl_out}")
             return
-
-        cfg = load_retrieval_config()
-        if args.archive:
-            cfg = RetrievalConfig(**{**cfg.__dict__, "archive_db": args.archive})
-        if args.qdrant:
-            cfg = RetrievalConfig(**{**cfg.__dict__, "qdrant_path": args.qdrant})
 
         writer = _build_writer(cfg)
         pipeline = IngestionPipeline(writer)
