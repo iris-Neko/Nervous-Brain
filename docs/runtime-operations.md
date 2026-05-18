@@ -35,7 +35,7 @@ tail -n 100 data/logs/telegram_bot_polling.stderr.log
 ps -eo pid,args | grep scripts/run_telegram_bot_polling.py | grep -v grep
 ```
 
-如果系统支持 user systemd，`restart_telegram_bot.sh` 会优先用 `systemd-run --user` 管理进程；否则回退到 `nohup`。
+如果系统支持 user systemd，`restart_telegram_bot.sh` 会优先用 `systemd-run --user` 管理进程；否则回退到 `nohup`。同一个 Telegram Bot token 不要启动多个 polling 进程；多群聊由一个进程按 `chat_id` 区分处理，响应范围由 `telegram_bot.allowed_chat_ids` 控制。
 
 ## Discord Bot
 
@@ -46,7 +46,7 @@ export DISCORD_BOT_TOKEN="<DISCORD_BOT_TOKEN>"
 mamba run -n nervos-brain python scripts/run_discord_bot.py
 ```
 
-该命令是前台运行，适合首次验证。长期运行请用 `tmux`、`systemd`、`supervisor` 或部署方已有进程管理；当前仓库暂未提供 Discord 专用 restart 脚本。
+该命令是前台运行，适合首次验证。长期运行请用 `tmux`、`systemd`、`supervisor` 或部署方已有进程管理；当前仓库暂未提供 Discord 专用 restart 脚本。Discord Developer Portal 必须开启 `MESSAGE CONTENT INTENT`。同一个 Discord Bot token 不建议启动多个 gateway 进程，响应范围由 `discord_bot.allowed_guild_ids` 和 `discord_bot.allowed_channel_ids` 控制。
 
 Discord runtime 数据默认写入：
 
@@ -160,6 +160,7 @@ journalctl --user -u nervos-talk-forum-ingest.service -n 100
 ## 运行边界
 
 - Telegram/Discord 普通问答不触发爬虫。
+- Telegram/Discord 并发由各自 `max_worker_threads` 控制；超过 worker 数的请求会排队。
 - Nervos Talk MCP 是只读实时查询工具，不写 archive 或 Qdrant。
 - Talk forum 写库由定时增量 ingest 服务负责。
 - `data/logs/`、`data/telegram_bot/`、`data/discord_bot/`、`data/qdrant_server/` 不提交。

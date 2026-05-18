@@ -76,9 +76,9 @@ retrieval_forum_talk   -> nervos_talk_user_discussions
 retrieval_github_code  -> nervos_github_code
 ```
 
-SQLite archive DB 是可提交/可复现的数据源，Docker Qdrant server 是运行时向量服务。`data/qdrant_server/` 是 Docker 运行目录，不提交；新机器 clone 后通过 `bootstrap_qdrant_server.sh` 从 archive DB 重建 Qdrant collection。
+SQLite archive DB 是可复现源数据，Docker Qdrant server 是运行时向量索引服务。`data/qdrant_server/` 是 Docker 运行目录，不提交；新机器 clone 后通过 `bootstrap_qdrant_server.sh` 从 archive DB 重建 Qdrant collection。可以简单理解为：archive DB 是可发布的资料源，Qdrant 是从资料源生成的搜索索引。
 
-GitHub code corpus 相关大文件使用 Git LFS。fresh clone 后必须运行：
+三套 archive DB 都由 Git LFS 管理。fresh clone 后必须运行：
 
 ```bash
 git lfs pull

@@ -1,6 +1,6 @@
 # 检索数据与 Qdrant 重建
 
-Nervos Brain 的检索采用双层存储：SQLite archive 保存完整文本，Qdrant 保存向量和轻量 payload。archive DB 是可复现源，Docker Qdrant server 是运行时服务。
+Nervos Brain 的检索采用双层存储：SQLite archive 保存完整文本，Qdrant 保存向量和轻量 payload。archive DB 是可复现源数据，Docker Qdrant server 是运行时向量索引服务。可以把 archive DB 理解成“原始资料库”，把 Qdrant collection 理解成“由原始资料生成的搜索索引”。换机器部署时，优先信任 archive DB；Qdrant collection 可以随时从 archive DB 重建。
 
 ## 三套检索库
 
@@ -27,7 +27,7 @@ data/github_code/archive.db
 ```text
 SQLite archive DB
 source JSONL
-必要的 Git LFS 大文件
+Git LFS 大文件
 迁移/重建脚本
 ```
 
@@ -48,13 +48,21 @@ mamba run -n nervos-brain python scripts/migrate_qdrant_server_from_archive.py \
 
 ## Git LFS
 
-GitHub code corpus 的部分大文件使用 Git LFS。clone 后必须执行：
+三套 archive DB 都使用 Git LFS 管理：
+
+```text
+data/archive.db
+data/forum_talk/archive.db
+data/github_code/archive.db
+```
+
+clone 后必须执行：
 
 ```bash
 git lfs pull
 ```
 
-如果 archive DB 仍是 LFS pointer，迁移脚本会提示运行 `git lfs pull`。
+如果 archive DB 仍是 LFS pointer，迁移脚本会提示运行 `git lfs pull`。检查时可以用 `git lfs ls-files` 确认三套 archive DB 都在 LFS 列表中。
 
 ## 本地 Qdrant fallback
 

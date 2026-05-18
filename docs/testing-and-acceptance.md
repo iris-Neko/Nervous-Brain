@@ -12,6 +12,13 @@ mamba run -n nervos-brain python -m py_compile \
   scripts/run_talk_forum_ingest.py
 ```
 
+确认 Git LFS 已拉取三套 archive DB：
+
+```bash
+git lfs ls-files | rg 'data/(archive|forum_talk/archive|github_code/archive)\.db'
+file data/archive.db data/forum_talk/archive.db data/github_code/archive.db
+```
+
 ## Qdrant 和检索
 
 ```bash
@@ -62,9 +69,10 @@ mamba run -n nervos-brain pytest tests/test_full_graph.py tests/test_reflection_
 ## 部署验收清单
 
 - `git lfs pull` 已执行。
+- `data/archive.db`、`data/forum_talk/archive.db`、`data/github_code/archive.db` 都不是 LFS pointer。
 - `config.yaml` 已创建但未提交。
 - `docker compose -f docker-compose.qdrant.yml ps` 显示 Qdrant 正常。
 - `curl http://127.0.0.1:6333/collections` 能看到三套 collection。
 - Telegram Bot 能启动，日志无 token/config 缺失错误。
-- Discord Bot 能启动，guild/channel 限制符合预期。
+- Discord Bot 能启动，Developer Portal 已开启 `MESSAGE CONTENT INTENT`，guild/channel 限制符合预期。
 - Talk forum ingest timer 如需启用，`systemctl --user list-timers` 能看到下一次执行时间。

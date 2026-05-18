@@ -1,9 +1,21 @@
-"""Evaluation dataset helpers for Week 7 multi-turn coverage."""
+"""Evaluation dataset helpers for regression and bad-case coverage."""
 
-from .dataset import default_week7_eval_path, load_eval_cases, validate_eval_case
+from .dataset import (
+    default_ai_generated_eval_path,
+    default_eval_paths,
+    default_human_collected_eval_path,
+    evaluation_dir,
+    load_all_eval_cases,
+    load_eval_cases,
+    validate_eval_case,
+)
 
 __all__ = [
-    "default_week7_eval_path",
+    "default_ai_generated_eval_path",
+    "default_eval_paths",
+    "default_human_collected_eval_path",
+    "evaluation_dir",
+    "load_all_eval_cases",
     "load_eval_cases",
     "validate_eval_case",
 ]

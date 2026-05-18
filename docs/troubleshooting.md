@@ -25,7 +25,8 @@ id
 
 ```bash
 git lfs status
-head -n 3 data/github_code/archive.db
+git lfs ls-files
+file data/archive.db data/forum_talk/archive.db data/github_code/archive.db
 ```
 
 修复：
@@ -33,6 +34,8 @@ head -n 3 data/github_code/archive.db
 ```bash
 git lfs pull
 ```
+
+修复后再运行 `file data/archive.db data/forum_talk/archive.db data/github_code/archive.db`，正常情况下应显示 SQLite database；如果仍显示文本文件或 Git LFS pointer，说明 LFS 对象没有成功拉下。
 
 ## Qdrant 没启动
 
@@ -134,9 +137,14 @@ Discord Bot token 错误
 allowed_guild_ids / allowed_channel_ids 限制不匹配
 Guild 消息没有 mention Bot，且 mention_only_in_guild=true
 Bot invite 权限或 intents 配置不完整
+Discord Developer Portal 未开启 MESSAGE CONTENT INTENT
 Qdrant 未启动或 collection 为空
 LLM provider 配置错误
 ```
+
+如果启动时报 `PrivilegedIntentsRequired`，进入 Discord Developer Portal，打开当前 Application 的 Bot 页面，在 Privileged Gateway Intents 中启用 `MESSAGE CONTENT INTENT`，保存后重启 Discord runtime。
+
+如果 Bot 已启动但频道里没有响应，还要确认邀请链接和服务器权限：Bot role 需要能查看目标频道、读取消息历史、发送消息；如果 `mention_only_in_guild=true`，服务器频道里需要 mention Bot 或 reply Bot。
 
 ## Telegram/Discord token 错误
 

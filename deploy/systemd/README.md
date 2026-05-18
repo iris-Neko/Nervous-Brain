@@ -1,18 +1,18 @@
-# Nervos Brain systemd user timers
+# Nervos Brain systemd 用户定时任务
 
-These files are deployment templates for local/server use. They are not required for tests.
+这些文件是本地或服务器部署模板，不是运行测试所必需的文件。安装前需要按实际机器路径修改 service 里的环境变量。
 
-## Talk forum incremental ingest
+## Talk forum 增量更新
 
-The Talk forum database is already fully crawled; the timer only keeps it fresh by crawling latest pages and skipping existing anchors.
+Talk forum 数据库已经完成全量爬取；这个 timer 只负责每天抓取最新页面，并跳过已经存在的帖子锚点。
 
-Default cadence: every 24 hours. Default command:
+默认频率：每 24 小时一次。默认命令：
 
 ```bash
 mamba run -n nervos-brain python scripts/run_talk_forum_ingest.py --latest-pages 3 --incremental
 ```
 
-Install for the current Linux user:
+为当前 Linux 用户安装：
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -22,7 +22,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now nervos-talk-forum-ingest.timer
 ```
 
-Edit these service variables before installing if your checkout or mamba path differs:
+如果仓库路径或 mamba 路径不同，安装前需要编辑这些 service 变量：
 
 ```ini
 Environment=PROJECT_ROOT=%h/path/to/Nervos-Brain
@@ -31,7 +31,7 @@ Environment=MAMBA_ENV=nervos-brain
 Environment=TALK_LATEST_PAGES=3
 ```
 
-Check status and logs:
+查看状态和日志：
 
 ```bash
 systemctl --user status nervos-talk-forum-ingest.timer
@@ -40,18 +40,18 @@ journalctl --user -u nervos-talk-forum-ingest.service -n 100
 ```
 
 
-## GitHub docs/code incremental ingest
+## GitHub docs/code 增量更新
 
-The GitHub docs/code corpora can be refreshed weekly. Runtime state stays local under `data/ingest_state/` because it is a machine-specific cursor. Public manifests are written under `data/manifests/` as commit/version evidence for the published corpus.
+GitHub docs/code 语料默认每周刷新一次。运行 state 保存在 `data/ingest_state/`，这是本机私有游标，不提交。公开 manifest 写入 `data/manifests/`，用于记录公开语料覆盖的 repo、branch、commit 和写入数量。
 
-Default command:
+默认命令：
 
 ```bash
 mamba run -n nervos-brain python scripts/run_github_docs_ingest.py --incremental
 mamba run -n nervos-brain python scripts/run_github_code_ingest.py --incremental
 ```
 
-Install the user timer:
+安装用户 timer：
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -61,7 +61,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now nervos-github-ingest.timer
 ```
 
-Optional GitHub token file to reduce rate limits:
+可选：配置 GitHub token 文件以降低 rate limit 风险：
 
 ```bash
 mkdir -p ~/.config/nervos-brain
@@ -71,7 +71,7 @@ ENV
 chmod 600 ~/.config/nervos-brain/github-ingest.env
 ```
 
-Check status and logs:
+查看状态和日志：
 
 ```bash
 systemctl --user status nervos-github-ingest.timer

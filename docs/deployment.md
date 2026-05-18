@@ -35,7 +35,13 @@ git checkout dev  # 当前交付/部署分支
 git lfs pull
 ```
 
-`git lfs pull` 很重要。部分 archive DB / Qdrant fallback 文件由 LFS 管理，如果只拿到 LFS pointer，后续迁移会失败。
+`git lfs pull` 很重要。三套 archive DB 和部分 Qdrant fallback 文件由 LFS 管理，如果只拿到 LFS pointer，后续迁移会失败。三套 archive DB 是：
+
+```text
+data/archive.db
+data/forum_talk/archive.db
+data/github_code/archive.db
+```
 
 ## 3. 创建 Python 环境
 
@@ -118,7 +124,15 @@ mamba run -n nervos-brain python scripts/run_discord_bot.py
 
 这个命令是前台运行，适合首次验证。长期运行请用 `tmux`、`systemd`、`supervisor` 或部署方已有进程管理；当前仓库暂未提供 Discord 专用 restart 脚本。Discord 配置见 `config.yaml.example` 的 `discord_bot` 区块。
 
-## 8. 部署后验收
+Discord Developer Portal 必须为该 Bot 开启 `MESSAGE CONTENT INTENT`，否则 runtime 会在连接 Discord Gateway 时抛出 `PrivilegedIntentsRequired`。邀请 Bot 到服务器时，至少需要让它能读取频道消息并发送消息；如果频道有更细权限控制，还要确认 Bot role 能访问目标 channel。
+
+## 8. 多群和并发边界
+
+一个 Telegram Bot token 只应启动一个 polling 进程。该进程可以同时服务多个群聊；用 `telegram_bot.allowed_chat_ids` 白名单控制允许响应的群。为空时不限制群；正式部署建议显式填写允许的群。超出 `telegram_bot.max_worker_threads` 的并发请求会排队。
+
+Discord 也不建议用同一个 Bot token 启多个 gateway 进程。首次部署保持一个 Discord runtime 进程即可；可用 `discord_bot.allowed_guild_ids` 和 `discord_bot.allowed_channel_ids` 控制响应范围。并发由 `discord_bot.max_worker_threads` 控制，超出后排队。
+
+## 9. 部署后验收
 
 建议至少运行：
 
